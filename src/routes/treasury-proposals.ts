@@ -23,7 +23,7 @@ import { rateLimited } from "../lib/rate-limit";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { requireGroupRole } from "../plugins/group-access";
+import { requireGroupRole } from "../middleware";
 import { getTreasuryAccount } from "../services/treasury-stellar";
 import { isPositive } from "../services/money";
 import { serializeGroup, serializeTreasuryProposal } from "../serializers";

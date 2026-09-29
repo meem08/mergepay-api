@@ -92,6 +92,43 @@ export const groupCurrencySchema = z.enum(GROUP_CURRENCIES, {
   errorMap: () => ({ message: "Currency must be XLM or USDC" }),
 });
 
+/**
+ * Reject a payload that declares the same setting through more than one of the
+ * currency aliases with different values.
+ *
+ * `currency`, `currencyType`, and `defaultCurrency` are all optional aliases
+ * for the group's currency, kept because clients spell the field differently.
+ * Each is validated against `GROUP_CURRENCIES` on its own, but a body like
+ * `{ currency: "XLM", currencyType: "USDC" }` passes that check while being
+ * self-contradictory: at most one value can be honoured, so the other is
+ * silently dropped and the client cannot tell which. That is precisely the
+ * silent-data-loss failure the strict schemas exist to prevent, so the
+ * contradiction is a 400 instead of a coin-flip resolved by field order.
+ */
+function refineConsistentCurrency(
+  value: {
+    currency?: GroupCurrency;
+    currencyType?: GroupCurrency;
+    defaultCurrency?: GroupCurrency;
+  },
+  ctx: z.RefinementCtx
+): void {
+  const declared = [
+    value.currency,
+    value.currencyType,
+    value.defaultCurrency,
+  ].filter((code): code is GroupCurrency => code !== undefined);
+
+  if (new Set(declared).size > 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["currency"],
+      message:
+        "currency, currencyType, and defaultCurrency must agree when more than one is provided",
+    });
+  }
+}
+
 /** Member item payload for group creation/update lists. */
 export const groupMemberInputSchema = z.union([
   z.string().min(1).max(64),
@@ -119,7 +156,8 @@ export const createGroupSchema = z
     members: z.array(groupMemberInputSchema).optional(),
     metadata: groupMetadataSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(refineConsistentCurrency);
 
 // ---------------------------------------------------------------------------
 // Group update
@@ -159,7 +197,8 @@ export const updateGroupSchema = z
     {
       message: "At least one of name, description, currency, members, or metadata is required",
     }
-  );
+  )
+  .superRefine(refineConsistentCurrency);
 
 
 // ---------------------------------------------------------------------------

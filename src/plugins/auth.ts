@@ -1,33 +1,18 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
-import jwt, { JwtPayload, TokenExpiredError } from "jsonwebtoken";
 import { z } from "zod";
-import { config } from "../config";
 import { Errors } from "../errors";
+import { verifyToken } from "../services/jwt";
+import type { AuthUser } from "../services/jwt";
 
-/**
- * Minimum remaining lifetime (seconds) a JWT must have when presented.
- * Tokens whose `exp` claim is closer than this margin to the current clock
- * are rejected as near-expired.
+/*
+ * The JWT utilities live in src/services/jwt.ts (issue #421). They are
+ * re-exported here so this plugin stays the single import point the routes
+ * and tests have always used, while the crypto itself remains unit-testable
+ * without building a Fastify instance.
  */
-const TOKEN_EXPIRY_MARGIN_SECONDS = config.TOKEN_EXPIRY_MARGIN_SECONDS ?? 30;
-
-/** Client-facing hint for recovering an expired session. */
-const REAUTH_HINT = {
-  code: "REAUTHENTICATE",
-  message:
-    "Your session has expired. Re-authenticate via SEP-10 to continue, or refresh your session if you hold a valid refresh token.",
-  endpoints: {
-    sep10Challenge: "/auth/challenge",
-    sep10Verify: "/auth/verify",
-    refresh: "/auth/refresh",
-  },
-} as const;
-
-export interface AuthUser {
-  id: string;
-  stellarPublicKey: string;
-}
+export { signToken, verifyToken } from "../services/jwt";
+export type { AuthUser } from "../services/jwt";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -36,85 +21,6 @@ declare module "fastify" {
   interface FastifyInstance {
     authenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
-}
-
-const JWT_ALGORITHM = "HS256" as const;
-
-/**
- * Mint a session token. `jwtid` is set for SEP-10 logins to the challenge
- * transaction hash, which SEP-10 names as the token's `jti`.
- */
-export function signToken(user: AuthUser, opts: { jwtid?: string } = {}): string {
-  return jwt.sign(
-    { sub: user.id, pk: user.stellarPublicKey },
-    config.JWT_SECRET,
-    {
-      algorithm: JWT_ALGORITHM,
-      expiresIn: config.jwtExpiresIn,
-      issuer: config.JWT_ISSUER,
-      audience: config.JWT_AUDIENCE,
-      ...(opts.jwtid ? { jwtid: opts.jwtid } : {}),
-    }
-  );
-}
-
-/**
- * Verify a bearer token and return the account it was issued for.
- *
- * Enforces algorithm, issuer, audience, and expiration in addition to the
- * signature so a token minted for a different environment/audience (or
- * signed with a different algorithm) is rejected outright, and validates the
- * claim shape so a malformed/tampered payload can't be coerced into
- * authenticating as an arbitrary account.
- *
- * Rejections are classified so the client can pick the right remedy (see
- * #16): an expired token is `TOKEN_EXPIRED` — the credential was once good
- * and the session can be refreshed or re-established via SEP-10 — while
- * anything unverifiable (malformed JWT, wrong signature, wrong issuer or
- * audience, not-yet-valid, missing claims) is `INVALID_TOKEN`. Only the
- * coarse code is returned; the underlying jsonwebtoken error text is never
- * echoed, because it can leak which claim mismatched.
- */
-export function verifyToken(token: string): AuthUser {
-  let decoded: JwtPayload;
-  try {
-    decoded = jwt.verify(token, config.JWT_SECRET, {
-      algorithms: [JWT_ALGORITHM],
-      issuer: config.JWT_ISSUER,
-      audience: config.JWT_AUDIENCE,
-    }) as JwtPayload;
-  } catch (err) {
-    if (err instanceof TokenExpiredError) {
-      throw Errors.tokenExpired(undefined, REAUTH_HINT);
-    }
-    // Malformed JWT, wrong signature, disallowed algorithm, wrong
-    // issuer/audience, token not yet valid — none of these can be redeemed
-    // by refreshing, so they share one code and one message.
-    throw Errors.invalidToken(undefined, REAUTH_HINT);
-  }
-
-  // Tokens this server mints always carry an expiry, so a well-signed
-  // payload without `exp` is not a session we issued. Requiring the claim
-  // also makes the margin check below unconditional.
-  if (typeof decoded.exp !== "number") {
-    throw Errors.invalidToken();
-  }
-
-  // Reject tokens that are too close to expiry: even though the SDK's own
-  // check would still accept them within this margin, a token forged or
-  // replayed moments before expiry should never grant a session. Reported
-  // as TOKEN_EXPIRED because the client remedy is the same: get a new one.
-  const remainingSeconds = decoded.exp - Math.floor(Date.now() / 1000);
-  if (remainingSeconds < TOKEN_EXPIRY_MARGIN_SECONDS) {
-    throw Errors.tokenExpired(undefined, REAUTH_HINT);
-  }
-
-  const { sub, pk } = decoded;
-  if (typeof sub !== "string" || !sub || typeof pk !== "string" || !pk) {
-    throw Errors.invalidToken();
-  }
-
-  return { id: sub, stellarPublicKey: pk };
 }
 
 const authorizationHeaderSchema = z

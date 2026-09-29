@@ -6,7 +6,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
-import { groupMembership, requireGroupRole } from "../plugins/group-access";
+import { groupMembership, requireGroupRole } from "../middleware";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
 import { auditGroupMemberActionTx, auditTx } from "../services/audit";
