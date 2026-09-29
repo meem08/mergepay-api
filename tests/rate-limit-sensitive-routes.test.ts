@@ -599,3 +599,187 @@ describe("expense creation rate limiting (#518)", () => {
     expect(list.statusCode).not.toBe(429);
   });
 });
+
+/**
+ * Issue #509 — Implement rate limiting and request throttling on high-frequency API routes.
+ *
+ * To protect the API backend from denial-of-service attempts and resource exhaustion,
+ * rate limiting is configured and applied to sensitive endpoints such as authentication (SEP-10),
+ * expense submission, and transaction verification.
+ *
+ * Acceptance Criteria verified:
+ *   - Register and configure @fastify/rate-limit in Fastify application bootstrap.
+ *   - Apply custom rate limit configurations to auth and payment mutation routes.
+ *   - Add tests verifying that exceeding rate limits returns 429 Too Many Requests with
+ *     standard headers (X-RateLimit-*) and clean JSON error responses.
+ *   - Ensure legitimate requests within rate limits pass without disruption.
+ *   - Sequential test requests exceeding the configured threshold confirm 429 responses.
+ */
+describe("rate limiting and request throttling on high-frequency API routes (#509)", () => {
+  function tokenFor(userId: string) {
+    const token = signToken({
+      id: userId,
+      stellarPublicKey: Keypair.random().publicKey(),
+    });
+    return { authorization: `Bearer ${token}` };
+  }
+
+  function validExpense(userId: string) {
+    return {
+      title: "Legitimate grocery run",
+      amount: "25.0000000",
+      assetCode: "XLM",
+      splitType: "equal",
+      shares: [{ userId }],
+    };
+  }
+
+  it("ensures legitimate requests within rate limits pass without disruption", async () => {
+    const max = policies.authChallenge.max;
+    const client = Keypair.random();
+    const remoteAddress = "198.51.100.201";
+
+    // Send 5 sequential requests (well below threshold of 20)
+    for (let i = 0; i < 5; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/auth/challenge",
+        remoteAddress,
+        payload: { account: client.publicKey() },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers["x-ratelimit-limit"]).toBe(String(max));
+      expect(res.headers["x-ratelimit-remaining"]).toBe(String(max - 1 - i));
+    }
+  });
+
+  it("throttles sequential requests exceeding threshold on authentication endpoints (SEP-10)", async () => {
+    const max = policies.authChallenge.max;
+    const client = Keypair.random();
+    const remoteAddress = "198.51.100.202";
+
+    // Exhaust the bucket with sequential valid challenge requests
+    for (let i = 0; i < max; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/auth/challenge",
+        remoteAddress,
+        payload: { account: client.publicKey() },
+      });
+      expect(res.statusCode).not.toBe(429);
+    }
+
+    // The sequential request exceeding threshold must return 429
+    const blocked = await app.inject({
+      method: "POST",
+      url: "/auth/challenge",
+      remoteAddress,
+      payload: { account: client.publicKey() },
+    });
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(blocked.headers["retry-after"]).toBeDefined();
+    expect(blocked.headers["x-ratelimit-reset"]).toBeDefined();
+
+    const body = blocked.json();
+    expect(body.code).toBe("RATE_LIMITED");
+    expect(body.requestId).toBeTruthy();
+    expect(typeof body.message).toBe("string");
+  });
+
+  it("throttles sequential requests exceeding threshold on expense submission routes", async () => {
+    const max = policies.expenseCreate.max;
+    const userId = "user_509_expense_submitter";
+    const headers = tokenFor(userId);
+    const groupUrl = "/groups/00000000-0000-0000-0000-000000000000/expenses";
+
+    for (let i = 0; i < max; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: groupUrl,
+        headers,
+        payload: validExpense(userId),
+      });
+      expect(res.statusCode).not.toBe(429);
+    }
+
+    const blocked = await app.inject({
+      method: "POST",
+      url: groupUrl,
+      headers,
+      payload: validExpense(userId),
+    });
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(blocked.headers["retry-after"]).toBeDefined();
+    expect(blocked.json().code).toBe("RATE_LIMITED");
+  });
+
+  it("throttles sequential requests exceeding threshold on transaction verification / confirmation routes", async () => {
+    const max = policies.settlementConfirm.max;
+    const userId = "user_509_confirm_submitter";
+    const headers = tokenFor(userId);
+    const confirmUrl = "/settlements/00000000-0000-0000-0000-000000000000/confirm";
+
+    for (let i = 0; i < max; i++) {
+      const res = await app.inject({
+        method: "POST",
+        url: confirmUrl,
+        headers: { ...headers, "x-idempotency-key": `conf-509-${i}` },
+        payload: { signedXdr: signedXdr() },
+      });
+      expect(res.statusCode).not.toBe(429);
+    }
+
+    const blocked = await app.inject({
+      method: "POST",
+      url: confirmUrl,
+      headers: { ...headers, "x-idempotency-key": "conf-509-blocked" },
+      payload: { signedXdr: signedXdr() },
+    });
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.headers["x-ratelimit-limit"]).toBe(String(max));
+    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(blocked.headers["retry-after"]).toBeDefined();
+    expect(blocked.json().code).toBe("RATE_LIMITED");
+  });
+
+  it("guarantees independent throttling budgets between auth, mutations, and read routes", async () => {
+    const authMax = policies.authChallenge.max;
+    const client = Keypair.random();
+    const remoteAddress = "198.51.100.204";
+
+    // Throttle the auth endpoint
+    for (let i = 0; i < authMax + 1; i++) {
+      await app.inject({
+        method: "POST",
+        url: "/auth/challenge",
+        remoteAddress,
+        payload: { account: client.publicKey() },
+      });
+    }
+
+    // Health and documentation reads are unaffected and pass with 200
+    const health = await app.inject({ method: "GET", url: "/health", remoteAddress });
+    expect(health.statusCode).toBe(200);
+
+    const docs = await app.inject({ method: "GET", url: "/docs/json", remoteAddress });
+    expect(docs.statusCode).toBe(200);
+
+    // Authenticated expense submission from another user has full budget
+    const userId = "user_509_isolated";
+    const groupUrl = "/groups/00000000-0000-0000-0000-000000000000/expenses";
+    const expenseRes = await app.inject({
+      method: "POST",
+      url: groupUrl,
+      remoteAddress,
+      headers: tokenFor(userId),
+      payload: validExpense(userId),
+    });
+    expect(expenseRes.statusCode).not.toBe(429);
+    expect(expenseRes.headers["x-ratelimit-limit"]).toBe(String(policies.expenseCreate.max));
+  });
+});
+
