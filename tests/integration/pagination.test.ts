@@ -10,8 +10,11 @@ import {
 } from "./helpers";
 
 const TEST_TIMEOUT = 30000;
+// Like full-flow.test.ts this needs a running API server and Stellar testnet.
+// CI runs the Postgres-backed suites; opt in locally with RUN_LIVE_INTEGRATION.
+const RUN_LIVE_INTEGRATION = process.env.RUN_LIVE_INTEGRATION === "true";
 
-describe("Pagination Integration Flow", () => {
+describe.skipIf(!RUN_LIVE_INTEGRATION)("Pagination Integration Flow", () => {
   let adminToken: string;
   let adminKeypair: Keypair;
   let groupId: string;

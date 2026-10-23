@@ -71,7 +71,7 @@ function fakeSettlement(over: Record<string, unknown> = {}) {
     groupId: "group_1",
     fromUserId: MEMBER,
     toUserId: "user_2",
-    amount: "10",
+    amount: "10.0000000",
     assetCode: "XLM",
     assetIssuer: null,
     stellarTxHash: null,
@@ -237,13 +237,11 @@ describe("GET /settlements/:id/status — access", () => {
     expect(res.statusCode).toBe(403);
     const body = res.json();
     expect(body.error.code).toBe("FORBIDDEN");
-    // No amount, party, group, asset, or hash in the refusal. The requestId is
-    // a random correlation id that legitimately appears on every error response
-    // (and is not settlement data), so exclude it — otherwise a short token like
-    // "10" spuriously matches a hex digit run in the id and flakes CI.
-    const { requestId: _requestId, ...rest } = body;
-    const serialized = JSON.stringify(rest);
-    for (const leak of ["10", KEY_B, "group_1", "XLM", "ABC123"]) {
+    // No amount, party, group, asset, or hash in the refusal. Use a distinctive
+    // amount string so generic metadata like the request id or timestamp cannot
+    // accidentally satisfy the leak check.
+    const serialized = JSON.stringify(body);
+    for (const leak of ["10.0000000", KEY_B, "group_1", "XLM", "ABC123"]) {
       expect(serialized).not.toContain(leak);
     }
   });

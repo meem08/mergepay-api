@@ -427,6 +427,26 @@ cover the settlement engine (splits, net balances, greedy suggestions), money
 math, SEP-10 challenge/verify, signed-XDR validation, and the auth & group routes
 via `app.inject`.
 
+### Integration tests (PostgreSQL)
+
+The integration suite drives the real routes against PostgreSQL 16. Horizon is
+stubbed so no Stellar account or network access is needed.
+
+```bash
+# Any reachable PostgreSQL database works; this is the CI connection string.
+export DATABASE_URL_TEST=postgresql://postgres:postgres@localhost:5432/mergepay_test
+export DATABASE_URL="$DATABASE_URL_TEST"
+
+npm run prisma:generate
+npm run prisma:deploy
+npm run test:integration
+```
+
+CI runs this suite against a `postgres:16` service (see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml)). The live SEP-10/testnet
+flows in `tests/integration/full-flow.test.ts` and `pagination.test.ts` are
+opt-in: set `RUN_LIVE_INTEGRATION=true` with the API server running.
+
 ## Local API exploration (REST Client)
 
 [docs/api.http](docs/api.http) is a committed request collection for the

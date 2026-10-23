@@ -73,7 +73,11 @@ import {
   evaluatePreflight,
 } from "../services/settlement-preflight";
 
-const settlementInclude = { from: true, to: true, statusHistory: true } as const;
+// StatusHistory is polymorphic (entityType + entityId) and has no Prisma
+// relation back to Settlement, so including it here fails at runtime with a
+// PrismaClientValidationError. Serialized settlements treat a missing history
+// as an empty list.
+const settlementInclude = { from: true, to: true } as const;
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });
@@ -289,7 +293,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           metadata: {
             from: auth.id,
             to: expense.payerUserId,
-            amount: myShare.shareAmount,
+            amount: myShare.shareAmount.toString(),
             assetCode,
           },
         });
