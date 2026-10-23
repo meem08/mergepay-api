@@ -204,7 +204,6 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
         description:
           "Returns a paginated, filterable list of the group's expenses. Requires membership.",
         params: openApiIdParams(),
-        querystring: openApiBody(expenseListQuerySchema, { enforce: false }),
         response: {
           ...openApiResponse(
             {

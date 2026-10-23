@@ -149,7 +149,6 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
         summary: "List the caller's groups",
         description:
           "Returns the groups the caller belongs to, each with a member count and the caller's net balance. Keyset-paginated.",
-        querystring: openApiBody(paginationQuerySchema, { enforce: false }),
         response: {
           ...openApiResponse(
             {
