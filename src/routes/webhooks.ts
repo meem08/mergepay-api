@@ -1,18 +1,25 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { config } from "../config";
 import { prisma } from "../db";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { requireAdmin, requireMembership } from "../services/access";
+import { requireMembership, requireAdmin } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { WEBHOOK_EVENT_TYPES } from "../services/event";
-import { ipKey } from "../services/rate-limit-keys";
+import { rateLimited } from "../lib/rate-limit";
 import {
   applySep24Callback,
   sep24CallbackSchema,
   verifySep24Signature,
 } from "../services/sep24";
 import { createWebhookSecret, dispatchWebhook } from "../services/webhook";
+import {
+  deliveryListQuerySchema,
+  listGroupWebhooks,
+  listWebhookDeliveries,
+  webhookListQuerySchema,
+} from "../services/webhook-listing";
+import { audit } from "../services/audit";
 
 const paramsSchema = z.object({ groupId: z.string().min(1) });
 const webhookParamsSchema = paramsSchema.extend({
@@ -77,13 +84,25 @@ async function sep24CallbackRoute(app: FastifyInstance) {
   );
 
   app.post(
-    "/api/webhooks/sep24",
+    "/webhooks/sep24",
     {
-      config: {
-        rateLimit: {
-          max: config.SEP24_RATE_LIMIT_MAX,
-          timeWindow: config.SEP24_RATE_LIMIT_WINDOW_MS,
-          keyGenerator: ipKey("sep24.webhook"),
+      ...rateLimited("sep24Webhook"),
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Process SEP-24 anchor webhook (HMAC-signed)",
+        description:
+          "Accepts SEP-24 transaction status callbacks authenticated with a pre-shared HMAC-SHA256 secret.",
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              received: { type: "boolean" },
+              status: { type: "string" },
+              matched: { type: "integer" },
+              updated: { type: "integer" },
+            },
+          },
         },
       },
     },
@@ -102,7 +121,7 @@ async function sep24CallbackRoute(app: FastifyInstance) {
         // signature was malformed, stale, or simply wrong hands an attacker a
         // free oracle for probing the secret.
         req.log.warn(
-          { reason: verification.reason, route: "/api/webhooks/sep24" },
+          { reason: verification.reason, route: "/webhooks/sep24" },
           "rejected SEP-24 callback"
         );
         throw Errors.unauthorized("Invalid webhook signature");
@@ -162,30 +181,63 @@ async function webhookManagementRoutes(app: FastifyInstance) {
   // never included in any subsequent read: a caller who loses it registers a
   // new endpoint rather than recovering the old one, which keeps a leaked
   // response body from being enough to forge signed payloads later.
-  app.post("/api/webhooks", async (req, reply) => {
+  app.post("/webhooks", rateLimited("webhookCreate"), async (req, reply) => {
     const auth = requireUser(req);
     const body = registerSchema.parse(req.body);
 
     if (body.groupId) {
-      await requireMembership(body.groupId, auth.id);
+      // A group webhook streams the group's financial events (settlements,
+      // expense changes) to a caller-supplied URL, so registering one is an
+      // administration decision, not an ordinary membership privilege — the
+      // same bar as treasury withdrawal and member removal. It also runs
+      // inside the same transaction as the row insert so a caller demoted
+      // between the check and the write cannot slip an ex-admin's endpoint
+      // through (the atomicity convention every other admin action here
+      // follows).
+      const webhook = await prisma.$transaction(async (tx) => {
+        await requireAdmin(body.groupId!, auth.id, tx);
 
-      const count = await prisma.webhook.count({
-        where: { groupId: body.groupId },
+        const count = await tx.webhook.count({
+          where: { groupId: body.groupId },
+        });
+        if (count >= 10) {
+          throw Errors.badRequest(
+            "webhook_limit_reached",
+            "A group can have at most 10 webhooks"
+          );
+        }
+
+        return tx.webhook.create({
+          data: {
+            groupId: body.groupId,
+            // A group registration belongs to the group, not to whoever
+            // created it, so it keeps working after that member leaves.
+            userId: null,
+            url: body.url,
+            secret: createWebhookSecret(),
+            events: body.events,
+            enabled: true,
+          },
+        });
       });
-      if (count >= 10) {
-        throw Errors.badRequest(
-          "webhook_limit_reached",
-          "A group can have at most 10 webhooks"
-        );
-      }
+
+      await audit({
+        userId: auth.id,
+        groupId: body.groupId,
+        action: "webhook.register",
+        entityType: "webhook",
+        entityId: webhook.id,
+        metadata: { url: body.url, events: body.events },
+      });
+
+      return reply.code(201).send({ webhook: publicWebhook(webhook, true) });
     }
 
     const webhook = await prisma.webhook.create({
       data: {
-        groupId: body.groupId ?? null,
-        // A group registration belongs to the group, not to whoever created
-        // it, so it keeps working after that member leaves.
-        userId: body.groupId ? null : auth.id,
+        groupId: null,
+        // A personal registration stays owned by the caller.
+        userId: auth.id,
         url: body.url,
         secret: createWebhookSecret(),
         events: body.events,
@@ -196,51 +248,71 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return reply.code(201).send({ webhook: publicWebhook(webhook, true) });
   });
 
-  app.post("/groups/:groupId/webhooks", async (req) => {
+  const asMember = { preHandler: requireGroupRole("member", { param: "groupId" }) };
+  const asAdmin = { preHandler: requireGroupRole("admin", { param: "groupId" }) };
+
+  app.post(
+    "/groups/:groupId/webhooks",
+    { ...asAdmin, ...rateLimited("webhookCreate") },
+    async (req) => {
     const auth = requireUser(req);
     const { groupId } = paramsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
     const body = createSchema.parse(req.body);
 
-    const count = await (prisma as any).webhook.count({ where: { groupId } });
-    if (count >= 10) {
-      throw Errors.badRequest(
-        "webhook_limit_reached",
-        "A group can have at most 10 webhooks"
-      );
-    }
+    // Same admin gate as POST /api/webhooks with a groupId: the endpoint
+    // streams group financial events to a caller-supplied URL. Check and
+    // insert run in one transaction for the same reason.
+    const webhook = await prisma.$transaction(async (tx) => {
+      await requireAdmin(groupId, auth.id, tx);
 
-    const webhook = await (prisma as any).webhook.create({
-      data: {
-        groupId,
-        userId: null,
-        url: body.url,
-        secret: createWebhookSecret(),
-        events: body.events,
-        enabled: true,
-      },
+      const count = await tx.webhook.count({ where: { groupId } });
+      if (count >= 10) {
+        throw Errors.badRequest(
+          "webhook_limit_reached",
+          "A group can have at most 10 webhooks"
+        );
+      }
+
+      return tx.webhook.create({
+        data: {
+          groupId,
+          userId: null,
+          url: body.url,
+          secret: createWebhookSecret(),
+          events: body.events,
+          enabled: true,
+        },
+      });
+    });
+
+    await audit({
+      userId: auth.id,
+      groupId,
+      action: "webhook.register",
+      entityType: "webhook",
+      entityId: webhook.id,
+      metadata: { url: body.url, events: body.events },
     });
 
     return { webhook: publicWebhook(webhook, true) };
   });
 
-  app.get("/groups/:groupId/webhooks", async (req) => {
-    const auth = requireUser(req);
+  // Paginated like every other list endpoint (#692). The endpoint count per
+  // group is small today, but an unbounded `findMany` is a response size no
+  // caller can predict, and a client that has to handle `meta` here handles
+  // it on the delivery list below too.
+  app.get("/groups/:groupId/webhooks", asMember, async (req) => {
     const { groupId } = paramsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
+    const query = webhookListQuerySchema.parse(req.query ?? {});
 
-    const webhooks = await (prisma as any).webhook.findMany({
-      where: { groupId },
-      orderBy: { createdAt: "desc" },
-    });
+    const { items, meta } = await listGroupWebhooks(groupId, query);
 
-    return { webhooks: webhooks.map((webhook: any) => publicWebhook(webhook)) };
+    return { webhooks: items.map((webhook: any) => publicWebhook(webhook)), meta };
   });
 
-  app.delete("/groups/:groupId/webhooks/:webhookId", async (req) => {
+  app.delete("/groups/:groupId/webhooks/:webhookId", asAdmin, async (req) => {
     const auth = requireUser(req);
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
-    await requireAdmin(groupId, auth.id);
 
     const webhook = await (prisma as any).webhook.findFirst({
       where: { id: webhookId, groupId },
@@ -248,13 +320,31 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     if (!webhook) throw Errors.notFound("Webhook not found");
 
     await (prisma as any).webhook.delete({ where: { id: webhookId } });
+
+    // The URL and event list are recorded because the row itself is gone:
+    // without them the trail says a webhook existed but not which endpoint
+    // stopped receiving the group's events.
+    await audit({
+      userId: auth.id,
+      groupId,
+      action: "webhook.deregister",
+      entityType: "webhook",
+      entityId: webhookId,
+      metadata: { url: webhook.url, events: webhook.events },
+    });
+
     return { deleted: true };
   });
 
-  app.post("/groups/:groupId/webhooks/:webhookId/test", async (req) => {
+  // Asking the server to ring a registered endpoint: one inbound request
+  // becomes an outbound delivery on the same retry schedule as a real event,
+  // so it carries the tightest write budget in the table (#693).
+  app.post(
+    "/groups/:groupId/webhooks/:webhookId/test",
+    { ...rateLimited("webhookTest"), ...asMember },
+    async (req) => {
     const auth = requireUser(req);
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
     const webhook = await (prisma as any).webhook.findFirst({
       where: { id: webhookId, groupId, enabled: true },
@@ -274,10 +364,18 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     return { queued: true };
   });
 
-  app.get("/groups/:groupId/webhooks/:webhookId/deliveries", async (req) => {
-    const auth = requireUser(req);
+  // Delivery history: one row per event per endpoint, kept for every retry,
+  // so this is the list that grows without bound (#692). Paged and filterable
+  // by delivery status and event type — the question a caller actually has is
+  // "what is failing to reach my endpoint", which should not require reading
+  // every success first.
+  //
+  // The response carries `deliverySummary` fields only: a delivery row also
+  // holds the signed request body and the receiver's response text, neither of
+  // which belongs in a list response. See src/services/webhook-listing.ts.
+  app.get("/groups/:groupId/webhooks/:webhookId/deliveries", asMember, async (req) => {
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
+    const query = deliveryListQuerySchema.parse(req.query ?? {});
 
     const webhook = await (prisma as any).webhook.findFirst({
       where: { id: webhookId, groupId },
@@ -285,11 +383,11 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     });
     if (!webhook) throw Errors.notFound("Webhook not found");
 
-    const deliveries = await (prisma as any).webhookDelivery.findMany({
-      where: { webhookId },
-      orderBy: { createdAt: "desc" },
-    });
+    // Scoped by the endpoint id resolved above, which was itself scoped to the
+    // caller's group — the cursor only decides where inside that set the page
+    // starts.
+    const { items, meta } = await listWebhookDeliveries(webhookId, query);
 
-    return { deliveries };
+    return { deliveries: items, meta };
   });
 }

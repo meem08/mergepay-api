@@ -83,6 +83,21 @@ export const ErrorCode = {
    * and sign it promptly. See src/services/sep10.ts.
    */
   CHALLENGE_EXPIRED: "CHALLENGE_EXPIRED",
+  /**
+   * 401 — the signed SEP-10 challenge declares a window that has not opened
+   * yet (its `minTime` is beyond the clock-skew tolerance). Distinct from
+   * CHALLENGE_EXPIRED (window closed) and UNAUTHORIZED (structural or
+   * signature failure): the envelope's bounds are present and usable but do
+   * not describe a presently redeemable challenge. See src/services/sep10.ts.
+   */
+  CHALLENGE_NOT_YET_VALID: "CHALLENGE_NOT_YET_VALID",
+  /**
+   * 401 — the signed SEP-10 challenge declares a window longer than the
+   * validity this server grants, so it is not an envelope this server issued
+   * however well it otherwise verifies. Distinct from CHALLENGE_EXPIRED and
+   * UNAUTHORIZED for the same reason. See src/services/sep10.ts.
+   */
+  CHALLENGE_WINDOW_TOO_LONG: "CHALLENGE_WINDOW_TOO_LONG",
   INVALID_CURSOR: "INVALID_CURSOR",
   // 401
   UNAUTHORIZED: "UNAUTHORIZED",
@@ -112,6 +127,14 @@ export const ErrorCode = {
   ALREADY_SETTLED: "ALREADY_SETTLED",
   EXPENSE_SETTLED: "EXPENSE_SETTLED",
   LAST_ADMIN: "LAST_ADMIN",
+  /**
+   * 409 — a unique constraint rejected the write, so a record with these values
+   * already exists. Distinct from the state codes above, which name a workflow
+   * the caller can inspect, and from a bare CONFLICT: here the request is
+   * well-formed and the remedy is a different value, not a different action.
+   * See src/lib/prisma-error.ts.
+   */
+  DUPLICATE_RECORD: "DUPLICATE_RECORD",
   // 429
   RATE_LIMITED: "RATE_LIMITED",
   // 500
@@ -125,6 +148,12 @@ export const ErrorCode = {
    * a transient dependency failure. See src/lib/provider-error.ts.
    */
   PROVIDER_REJECTED: "PROVIDER_REJECTED",
+  // 503 — a dependency this process needs is unavailable, so the request could
+  // not be attempted at all. Used for the database being unreachable, refused,
+  // or timed out — the same condition /health already reports as not-ready, and
+  // distinct from UPSTREAM_ERROR, which is a third-party HTTP dependency. See
+  // src/lib/prisma-error.ts.
+  SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -154,16 +183,17 @@ export const Errors = {
    * endpoint for clients holding a refresh token — so a wallet integration
    * can react to the code without hard-coding the API's auth flow.
    */
-  tokenExpired: (msg = "Token expired") =>
-    new AppError(401, ErrorCode.TOKEN_EXPIRED, msg, {
-      hint: "Re-authenticate via SEP-10 (POST /auth/challenge, then POST /auth/verify), or exchange a refresh token via POST /auth/refresh.",
-    }),
+  tokenExpired: (msg = "Token expired", details?: unknown) =>
+    new AppError(401, ErrorCode.TOKEN_EXPIRED, msg, details),
 
-  /** The bearer token failed verification — malformed, wrong signature, or
-   * missing claims. There is nothing to refresh; the caller must present a
-   * token this API actually minted. */
-  invalidToken: (msg = "Invalid token") =>
-    new AppError(401, ErrorCode.INVALID_TOKEN, msg),
+  /**
+   * The bearer token failed verification — malformed, wrong signature,
+   * disallowed algorithm, wrong issuer/audience, or a claims shape that does
+   * not identify an account. A refresh token cannot rescue a token like this;
+   * the client must re-authenticate via SEP-10.
+   */
+  invalidToken: (msg = "Invalid token", details?: unknown) =>
+    new AppError(401, ErrorCode.INVALID_TOKEN, msg, details),
 
   /**
    * The SEP-10 challenge the wallet signed has passed its validity window.
@@ -176,6 +206,16 @@ export const Errors = {
    */
   challengeExpired: (msg: string, details?: unknown) =>
     new AppError(401, ErrorCode.CHALLENGE_EXPIRED, msg, details),
+
+  /** The challenge's `minTime` has not been reached — bounds are usable but
+   * the window has not opened. See CHALLENGE_NOT_YET_VALID. */
+  challengeNotYetValid: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.CHALLENGE_NOT_YET_VALID, msg, details),
+
+  /** The challenge's window outlives the validity this server issues. See
+   * CHALLENGE_WINDOW_TOO_LONG. */
+  challengeWindowTooLong: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.CHALLENGE_WINDOW_TOO_LONG, msg, details),
 
   forbidden: (msg = "You do not have access to this resource") =>
     new AppError(403, ErrorCode.FORBIDDEN, msg),

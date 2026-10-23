@@ -69,6 +69,8 @@ describe("canTransitionSettlementStatus", () => {
     ["verifying", "submitted"],
     ["needs_review", "confirmed"],
     ["needs_review", "failed"],
+    ["pending_confirmation", "expired"],
+    ["needs_review", "expired"],
   ];
 
   const illegal: [SettlementStatus, SettlementStatus][] = [
@@ -108,6 +110,9 @@ describe("isTerminalSettlementStatus", () => {
   });
   it("returns true for failed", () => {
     expect(isTerminalSettlementStatus("failed")).toBe(true);
+  });
+  it("returns true for expired", () => {
+    expect(isTerminalSettlementStatus("expired")).toBe(true);
   });
   it.each(["pending", "submitted", "verifying", "needs_review", "unknown"])(
     "returns false for %s",
@@ -202,6 +207,7 @@ describe("applySettlementTransition", () => {
       data: expect.objectContaining({
         action: "settlement.status_changed",
         entityId: "settle_1",
+        groupId: "group_1",
         metadata: expect.objectContaining({
           from: "pending",
           to: "submitted",

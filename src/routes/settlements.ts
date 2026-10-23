@@ -20,16 +20,33 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../db";
-import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
+import {
+  openApiBody,
+  openApiEnvelope,
+  openApiErrorResponses,
+  openApiIdParams,
+  openApiResponse,
+} from "../lib/openapi";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
-import { requireMembership } from "../services/access";
+import { requireActiveMembership, requireMembership } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { stellar, memoText } from "../services/stellar";
 import { validateSettlementXdr } from "../services/settlement-xdr";
 import { shortCode } from "../services/codes";
-import { audit, auditTx } from "../services/audit";
+import { audit, auditTx, logActionTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
+import {
+  listGroupSettlements,
+  settlementListQuerySchema,
+} from "../services/settlement-history";
+import {
+  assertValidRange as assertValidLedgerRange,
+  includesType as includesLedgerType,
+  ledgerDateFilter,
+  ledgerQuerySchema,
+} from "../services/ledger";
 import {
   readIdempotencyKey,
   requireIdempotencyKey,
@@ -44,15 +61,15 @@ import {
   buildPage,
   cursorFilter,
   cursorOrderBy,
-  paginationQuerySchema,
   requireCursor,
   takeForPage,
 } from "../lib/pagination";
 import {
-  loadGroupBalancesWithSuggestions,
+  loadGroupBalancesWithSuggestionsByAsset,
   groupPrimaryAsset,
+  verifySettlementLimit,
 } from "../services/group-balances";
-import { calculateSimplifiedDebts } from "../services/settlement";
+import { balanceAssetKey, type Suggestion } from "../services/settlement";
 import { validateAsset, validateAmount } from "../services/assets";
 import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
 import {
@@ -73,10 +90,10 @@ import {
   evaluatePreflight,
 } from "../services/settlement-preflight";
 
-// StatusHistory is polymorphic (entityType + entityId) and has no Prisma
-// relation back to Settlement, so including it here fails at runtime with a
-// PrismaClientValidationError. Serialized settlements treat a missing history
-// as an empty list.
+// `StatusHistory` is a polymorphic table keyed by `(entityType, entityId)` with
+// no foreign key, so Prisma cannot include it from a settlement. Asking for it
+// was a `PrismaClientValidationError` — every route below 500s before this line
+// is reached. Read history with `getStatusHistory()` instead.
 const settlementInclude = { from: true, to: true } as const;
 
 /** Every route in this file takes a single opaque resource id. */
@@ -105,6 +122,9 @@ const executeBodySchema = z.object({
   settlementId: z.string().min(1).max(64),
   signedXdr: z.string().min(1),
 });
+
+/** Body of `POST /settlements/:id/confirm` — the wallet's signed envelope. */
+const confirmBodySchema = z.object({ signedXdr: z.string().min(1) });
 
 /** Request-body schemas used for OpenAPI documentation of the settlement
  * creation routes (both routes validate the payload with Zod in-handler; the
@@ -165,7 +185,10 @@ export default async function settlementRoutes(app: FastifyInstance) {
         summary: "Settle your share of an expense",
         params: openApiIdParams(),
         body: openApiBody(settleBodyDocSchema),
-        response: openApiEnvelope("settlement"),
+        response: {
+          ...openApiEnvelope("settlement"),
+          ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
+        },
       },
     },
     async (req) => {
@@ -191,7 +214,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       include: { shares: true, payer: true },
     });
     if (!expense) throw Errors.notFound("Expense not found");
-    await requireMembership(expense.groupId, auth.id);
+    await requireActiveMembership(expense.groupId, auth.id);
 
     const payerMembership = await prisma.groupMember.findUnique({
       where: { groupId_userId: { groupId: expense.groupId, userId: expense.payerUserId } },
@@ -284,12 +307,12 @@ export default async function settlementRoutes(app: FastifyInstance) {
           data: { status: "settling" },
         });
 
-        await auditTx(tx, {
-          userId: auth.id,
+        await logActionTx(tx, {
+          actorId: auth.id,
           groupId: expense.groupId,
           action: "settlement.create",
-          entityType: "settlement",
-          entityId: settlement.id,
+          resourceType: "settlement",
+          resourceId: settlement.id,
           metadata: {
             from: auth.id,
             to: expense.payerUserId,
@@ -324,18 +347,21 @@ export default async function settlementRoutes(app: FastifyInstance) {
     "/groups/:id/settlements",
     {
       ...createLimit,
+      preHandler: requireGroupRole("member", { param: "id", active: true }),
       schema: {
         tags: ["Settlements"],
         summary: "Settle up against a group's net balance",
         params: openApiIdParams(),
         body: openApiBody(freeformSettleBodyDocSchema),
-        response: openApiEnvelope("settlement"),
+        response: {
+          ...openApiEnvelope("settlement"),
+          ...openApiErrorResponses(400, 401, 403, 404, 429),
+        },
       },
     },
     async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
     const body = z
       .object({
         toUserId: z.string(),
@@ -364,6 +390,14 @@ export default async function settlementRoutes(app: FastifyInstance) {
       resourceId: groupId,
       payload: body,
       operation: async (tx) => {
+        await verifySettlementLimit(
+          tx,
+          groupId,
+          auth.id,
+          body.toUserId,
+          body.amount
+        );
+
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
@@ -426,10 +460,27 @@ export default async function settlementRoutes(app: FastifyInstance) {
   });
 
   // -- confirm (submit signed xdr) --------------------------------------------
-  app.post("/settlements/:id/confirm", confirmLimit, async (req) => {
+  app.post(
+    "/settlements/:id/confirm",
+    {
+      ...confirmLimit,
+      schema: {
+        tags: ["Settlements"],
+        summary: "Confirm a settlement with a signed transaction",
+        description:
+          "Validates the wallet's signed XDR against the original intent and submits it for on-chain execution. `Idempotency-Key` is required. Only the settlement's payer may confirm it.",
+        params: openApiIdParams(),
+        body: openApiBody(confirmBodySchema),
+        response: {
+          ...openApiEnvelope("settlement"),
+          ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
-    const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+    const body = confirmBodySchema.parse(req.body);
 
     // Required, not optional: this is the request that ends in a payment, and a
     // wallet or mobile client retrying after a timeout must never be able to
@@ -449,7 +500,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
       include: settlementInclude,
     });
     if (!settlementRow) throw Errors.notFound("Settlement not found");
-    await requireMembership(settlementRow.groupId, auth.id);
+    await requireActiveMembership(settlementRow.groupId, auth.id);
     if (settlementRow.fromUserId !== auth.id) {
       throw Errors.forbidden("Only the payer can confirm this settlement");
     }
@@ -626,13 +677,31 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // and network latency between a client and this API is exactly the condition
   // that produces an unacknowledged retry.
   app.post(
-    "/api/settlements/execute",
+    "/settlements/execute",
     {
       ...executeLimit,
       preHandler: app.idempotent({
         scope: "settlement.execute",
         required: true,
       }),
+      schema: {
+        tags: ["Settlements"],
+        summary: "Execute a settlement (idempotent submission)",
+        description:
+          "Submits a signed envelope toward Horizon with idempotency enforced at the HTTP layer. `X-Idempotency-Key` is required. Responds 202 when this request accepted the submission and 200 when it was already in flight.",
+        body: openApiBody(executeBodySchema),
+        response: {
+          ...openApiEnvelope("settlement"),
+          202: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              settlement: { type: "object", additionalProperties: true },
+            },
+          },
+          ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
+        },
+      },
     },
     async (req, reply) => {
       const auth = requireUser(req);
@@ -643,7 +712,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         include: settlementInclude,
       });
       if (!settlementRow) throw Errors.notFound("Settlement not found");
-      await requireMembership(settlementRow.groupId, auth.id);
+      await requireActiveMembership(settlementRow.groupId, auth.id);
       if (settlementRow.fromUserId !== auth.id) {
         throw Errors.forbidden("Only the payer can execute this settlement");
       }
@@ -751,15 +820,45 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // expense response.
   //
   // Access: any member of the settlement's group may read it, enforced through
-  // the same `requireMembership` helper every mutating route uses — there is no
-  // second authorization path here. A settlement that does not exist is a 404;
-  // one the caller may not inspect is a 403. That distinction is deliberate
-  // (clients need to tell "gone" from "not yours") and leaks only the existence
-  // of an opaque identifier, never any amount, party, group, or on-chain detail.
+  // the same `requireMembership` helper the mutating routes build on
+  // (`requireActiveMembership`) — there is no second authorization path here,
+  // only the read's deliberate lack of the archived-group refusal. A settlement
+  // that does not exist is a 404; one the caller may not inspect is a 403. That
+  // distinction is deliberate (clients need to tell "gone" from "not yours") and
+  // leaks only the existence of an opaque identifier, never any amount, party,
+  // group, or on-chain detail.
   //
   // The response never includes a signed or unsigned XDR, a token, provider
   // credentials, or upstream error text — see src/services/settlement-status.ts.
-  app.get("/settlements/:id/status", async (req) => {
+  app.get(
+    "/settlements/:id/status",
+    {
+      schema: {
+        tags: ["Settlements"],
+        summary: "Get a settlement's status",
+        description:
+          "Returns the public, safe-to-expose status of a settlement (by cuid or short code), optionally refreshing against Horizon. Any member of the settlement's group may read it. Never returns an XDR, token, or provider error text.",
+        params: openApiIdParams(),
+        response: {
+          ...openApiResponse(
+            {
+              settlement: { type: "object", additionalProperties: true },
+              status: { type: "string" },
+              terminal: { type: "boolean" },
+              onChain: { type: "object", additionalProperties: true, nullable: true },
+              failure: { type: "object", additionalProperties: true, nullable: true },
+              expiresAt: { type: "string", nullable: true, format: "date-time" },
+              expiresInSeconds: { type: "number", nullable: true },
+              createdAt: { type: "string", format: "date-time" },
+              updatedAt: { type: "string", format: "date-time" },
+              checkedAt: { type: "string", format: "date-time" },
+            }
+          ),
+          ...openApiErrorResponses(400, 401, 403, 404),
+        },
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = settlementIdParamSchema.parse(req.params);
     const { refresh } = settlementStatusQuerySchema.parse(req.query ?? {});
@@ -823,10 +922,12 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/settlements",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Settlements"],
         summary: "List settlements for a group",
-        description: "Returns paginated settlements scoped to the caller's group membership, ordered deterministically by creation timestamp and ID.",
+        description:
+          "Returns a paginated, filterable list of the group's settlements, ordered deterministically by creation timestamp and ID. Filter by public status, asset, and an inclusive date range; pass `includeTotal=true` for a count of the filtered set.",
         params: openApiIdParams(),
         response: {
           200: {
@@ -840,25 +941,23 @@ export default async function settlementRoutes(app: FastifyInstance) {
               meta: { type: "object", additionalProperties: true },
             },
           },
+          ...openApiErrorResponses(400, 401, 403),
         },
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
+    // Membership was checked by the route guard before any row is read, and
+    // the `groupId` filter the service applies is what scopes the page —
+    // never the cursor. See src/services/settlement-history.ts.
+    const query = settlementListQuerySchema.parse(req.query ?? {});
 
-    const position = requireCursor(cursor);
+    const { items, meta } = await listGroupSettlements(
+      groupId,
+      query,
+      settlementInclude
+    );
 
-    const settlements = await prisma.settlement.findMany({
-      where: { groupId, ...cursorFilter(position, order) },
-      include: settlementInclude,
-      orderBy: cursorOrderBy(order),
-      take: takeForPage(limit),
-    });
-
-    const { items, meta } = buildPage(settlements, limit, order);
     return { settlements: items.map(serializeSettlement), meta };
   });
 
@@ -866,6 +965,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/settlement/preview",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Settlements"],
         summary: "Preview group settlement suggestions",
@@ -882,27 +982,54 @@ export default async function settlementRoutes(app: FastifyInstance) {
                 type: "array",
                 items: { type: "object", additionalProperties: true },
               },
+              assets: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
             },
           },
+          ...openApiErrorResponses(400, 401, 403),
         },
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
-    const { balances } = await loadGroupBalancesWithSuggestions(groupId);
     const asset = await groupPrimaryAsset(groupId);
-    const suggestions = calculateSimplifiedDebts(
-      balances.map((balance) => ({ userId: balance.userId, net: balance.net }))
+    const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
+
+    // Top level stays the primary asset's operations for backward
+    // compatibility. `assets` carries every asset the group holds, each with
+    // its own net balances and minimal settle-up transfers — an XLM operation
+    // can never settle a USDC debt.
+    const primary = byAsset.find(
+      (a) =>
+        balanceAssetKey(a.assetCode, a.assetIssuer) ===
+        balanceAssetKey(asset.assetCode, asset.assetIssuer)
     );
+    const withAsset = (
+      assetCode: string,
+      assetIssuer: string | null,
+      suggestions: Suggestion[]
+    ) =>
+      suggestions.map((suggestion) => ({
+        ...suggestion,
+        assetCode,
+        assetIssuer,
+      }));
+
     return {
       assetCode: asset.assetCode,
       assetIssuer: asset.assetIssuer,
-      operations: suggestions.map((suggestion) => ({
-        ...suggestion,
-        assetCode: asset.assetCode,
-        assetIssuer: asset.assetIssuer,
+      operations: withAsset(
+        asset.assetCode,
+        asset.assetIssuer,
+        primary?.suggestions ?? []
+      ),
+      assets: byAsset.map((a) => ({
+        assetCode: a.assetCode,
+        assetIssuer: a.assetIssuer,
+        balances: a.balances,
+        operations: withAsset(a.assetCode, a.assetIssuer, a.suggestions),
       })),
     };
   });
@@ -910,6 +1037,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/balances",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Settlements"],
         summary: "Get group member balances and settlement suggestions",
@@ -928,48 +1056,86 @@ export default async function settlementRoutes(app: FastifyInstance) {
                 type: "array",
                 items: { type: "object", additionalProperties: true },
               },
+              assets: {
+                type: "array",
+                items: { type: "object", additionalProperties: true },
+              },
             },
           },
+          ...openApiErrorResponses(400, 401, 403),
         },
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    await requireMembership(groupId, auth.id);
 
-    const { balances, suggestions } = await loadGroupBalancesWithSuggestions(groupId);
+    const asset = await groupPrimaryAsset(groupId);
+    const byAsset = await loadGroupBalancesWithSuggestionsByAsset(groupId);
 
     const userIds = new Set<string>();
-    balances.forEach((b) => userIds.add(b.userId));
-    suggestions.forEach((s) => {
-      userIds.add(s.fromUserId);
-      userIds.add(s.toUserId);
+    byAsset.forEach((a) => {
+      a.balances.forEach((b) => userIds.add(b.userId));
+      a.suggestions.forEach((s) => {
+        userIds.add(s.fromUserId);
+        userIds.add(s.toUserId);
+      });
     });
     const users = await prisma.user.findMany({
       where: { id: { in: [...userIds] } },
     });
     const userMap = new Map(users.map((u) => [u.id, u]));
 
-    const asset = await groupPrimaryAsset(groupId);
-
-    return {
-      balances: balances
+    const serializeBalances = (
+      assetCode: string,
+      balances: { userId: string; net: string }[]
+    ) =>
+      balances
         .filter((b) => userMap.has(b.userId))
         .map((b) => ({
           userId: b.userId,
           user: serializeUserSafe(userMap.get(b.userId)),
           net: b.net,
-          assetCode: asset.assetCode,
-        })),
-      suggestions: suggestions.map((s) => ({
+          assetCode,
+        }));
+    const serializeSuggestions = (
+      assetCode: string,
+      assetIssuer: string | null,
+      suggestions: Suggestion[]
+    ) =>
+      suggestions.map((s) => ({
         fromUserId: s.fromUserId,
         from: serializeUserSafe(userMap.get(s.fromUserId)),
         toUserId: s.toUserId,
         to: serializeUserSafe(userMap.get(s.toUserId)),
         amount: s.amount,
-        assetCode: asset.assetCode,
-        assetIssuer: asset.assetIssuer,
+        assetCode,
+        assetIssuer,
+      }));
+
+    const primary = byAsset.find(
+      (a) =>
+        balanceAssetKey(a.assetCode, a.assetIssuer) ===
+        balanceAssetKey(asset.assetCode, asset.assetIssuer)
+    );
+
+    return {
+      // Top level is the primary asset for backward compatibility; `assets`
+      // carries the full per-asset picture.
+      balances: serializeBalances(asset.assetCode, primary?.balances ?? []),
+      suggestions: serializeSuggestions(
+        asset.assetCode,
+        asset.assetIssuer,
+        primary?.suggestions ?? []
+      ),
+      assets: byAsset.map((a) => ({
+        assetCode: a.assetCode,
+        assetIssuer: a.assetIssuer,
+        balances: serializeBalances(a.assetCode, a.balances),
+        suggestions: serializeSuggestions(
+          a.assetCode,
+          a.assetIssuer,
+          a.suggestions
+        ),
       })),
     };
   });
@@ -981,36 +1147,56 @@ export default async function settlementRoutes(app: FastifyInstance) {
   // using that identical total order, so the merged page obeys the shared
   // pagination contract: a cursor from any page resumes exactly where the last
   // one stopped, whichever table the boundary row came from.
-  app.get("/groups/:id/ledger", async (req) => {
-    const auth = requireUser(req);
+  app.get(
+    "/groups/:id/ledger",
+    { preHandler: requireGroupRole("member", { param: "id" }) },
+    async (req) => {
     const { id: groupId } = idParamSchema.parse(req.params);
-    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
+    const query = ledgerQuerySchema.parse(req.query ?? {});
+    const { cursor, limit, order } = query;
+    assertValidLedgerRange(query.startDate, query.endDate);
 
     const position = requireCursor(cursor);
-    const where = { groupId, ...cursorFilter(position, order) };
+    // The date bound is pushed into each table's query rather than applied to
+    // the merged page: each table is read with its own `limit + 1` window, so
+    // filtering after the merge would shrink pages and make `hasMore`
+    // describe the unfiltered scan. See src/services/ledger.ts.
+    const where = {
+      groupId,
+      ...ledgerDateFilter(query),
+      ...cursorFilter(position, order),
+    };
     const orderBy = cursorOrderBy(order);
     const take = takeForPage(limit);
 
+    // A `type` filter selects which tables are read at all, so a request for
+    // one kind issues one query instead of three. An unasked-for kind
+    // resolves to an empty array without touching the database.
     const [expenses, settlements, treasuryTxs] = await Promise.all([
-      prisma.expense.findMany({
-        where,
-        include: { payer: true, shares: { include: { user: true } } },
-        orderBy,
-        take,
-      }),
-      prisma.settlement.findMany({
-        where,
-        include: settlementInclude,
-        orderBy,
-        take,
-      }),
-      prisma.treasuryTransaction.findMany({
-        where,
-        include: { user: true },
-        orderBy,
-        take,
-      }),
+      includesLedgerType(query, "expense")
+        ? prisma.expense.findMany({
+            where,
+            include: { payer: true, shares: { include: { user: true } } },
+            orderBy,
+            take,
+          })
+        : [],
+      includesLedgerType(query, "settlement")
+        ? prisma.settlement.findMany({
+            where,
+            include: settlementInclude,
+            orderBy,
+            take,
+          })
+        : [],
+      includesLedgerType(query, "treasury")
+        ? prisma.treasuryTransaction.findMany({
+            where,
+            include: { user: true },
+            orderBy,
+            take,
+          })
+        : [],
     ]);
 
     const direction = order === "desc" ? -1 : 1;

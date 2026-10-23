@@ -1,29 +1,31 @@
-import pino from "pino";
 import { prisma } from "../db";
+import { config } from "../config";
 import { stellar } from "./stellar";
 import { audit } from "./audit";
-import { Errors } from "../errors";
+import { AppError, Errors } from "../errors";
 import { applySettlementTransition } from "./settlement-machine";
 import type { CorrelationContext } from "../lib/correlation";
 import { loggerWithContext } from "../lib/correlation";
+import { createLogger } from "../lib/logger";
 import {
   verifyTransactionMemo,
   verifyPaymentOperation,
   getTransactionPayments,
 } from "./horizonService";
+import { buildMemo, validateMemoAgainstActiveExpense } from "./memo";
 import { dispatchEvent } from "./webhook";
 
-const log = pino({ name: "settlement-reconciliation" });
+const log = createLogger({ name: "settlement-reconciliation" });
 
 /** Maximum number of reconciliation retries per settlement. */
 export const RECONCILIATION_MAX_RETRIES = 10;
 
 /**
- * The three states one Horizon lookup can leave a settlement in. `pending`
- * means Horizon has not seen the transaction yet — it is not a failure and
- * the settlement stays in `pending_confirmation`.
+ * The outcomes one Horizon lookup can leave a settlement in. `pending` means
+ * Horizon has not seen the transaction yet; `expired` means that absence
+ * continued beyond the configured pending-age limit.
  */
-export type SettlementReconciliationOutcome = "confirmed" | "failed" | "pending";
+export type SettlementReconciliationOutcome = "confirmed" | "failed" | "pending" | "expired";
 
 /**
  * Parameters needed for full settlement verification against Horizon.
@@ -37,6 +39,12 @@ export interface ReconcilableSettlement {
   retryCount: number;
   /** Settlement short code, used to derive the expected memo (MP:<code>). */
   shortCode: string;
+  /**
+   * Expense this settlement pays off. When present, verification resolves the
+   * parsed memo code against this record and refuses to confirm while the
+   * expense is missing or fully settled (see `validateMemoAgainstActiveExpense`).
+   */
+  expenseId?: string | null;
   /** Expected payment amount. */
   amount: string;
   /** Expected asset code (e.g. "XLM", "USDC"). */
@@ -45,6 +53,15 @@ export interface ReconcilableSettlement {
   assetIssuer: string | null;
   /** Expected payment destination (the recipient's Stellar public key). */
   destinationPublicKey: string;
+  /**
+   * Persisted status at read time. Only `needs_review` changes behavior: a
+   * row still without a Horizon answer is demoted to `pending_confirmation`
+   * so the retry budget governs. Optional — omitting it preserves the
+   * pre-needs_review behavior (retryCount-only update on not-found).
+   */
+  status?: string;
+  /** Time the transaction was submitted; used to expire unresolved jobs. */
+  pendingSince?: Date | null;
 }
 
 /**
@@ -60,6 +77,7 @@ export interface ReconcilableSettlement {
  *                                             retryCount incremented
  *                                             → `pending`
  *                                             If retries exhausted → `failed`
+ *                                             If pending-age limit elapsed → `expired`
  *   Verification failure (mismatch)        → `failed`     (terminal)
  *
  * Returns the observed outcome so the calling worker can aggregate batch
@@ -84,8 +102,41 @@ export async function reconcileSingleSettlement(
 
   if (tx.successful) {
     try {
-      const expectedMemo = `MP:${settlement.shortCode}`;
-      await verifyTransactionMemo(hash, expectedMemo);
+      // Generate the expected memo through the shared helper rather than a
+      // raw template literal: an unusable short code is a verification
+      // failure, not a string that silently never matches on-chain.
+      const expectedMemo = buildMemo(settlement.shortCode);
+      if (!expectedMemo.ok) {
+        throw Errors.badRequest(
+          "transaction_verification_failed",
+          `Memo verification failed: ${expectedMemo.message}`
+        );
+      }
+      // Missing, hash, id, malformed, or mismatched on-chain memos all throw
+      // a TRANSACTION_VERIFICATION_FAILED AppError here, so a payment is only
+      // attributed to this settlement when its memo is exactly MP:<shortCode>.
+      const onChain = await verifyTransactionMemo(hash, expectedMemo.memo);
+
+      // The memo must still resolve to a *live* expense: parse the memo that
+      // actually landed on-chain and check the settlement's expense record
+      // exists with shares still outstanding before this worker is allowed to
+      // confirm. Settlements created before expense linking have no record to
+      // validate against and skip this.
+      if (settlement.expenseId) {
+        const validation = await validateMemoAgainstActiveExpense(
+          onChain.memo,
+          {
+            expectedCode: settlement.shortCode,
+            expenseId: settlement.expenseId,
+          }
+        );
+        if (!validation.ok) {
+          throw Errors.badRequest(
+            "transaction_verification_failed",
+            `Memo verification failed: ${validation.message}`
+          );
+        }
+      }
 
       const payments = await getTransactionPayments(hash);
       const paymentOp = payments.find((op) => op.type === "payment");
@@ -103,11 +154,13 @@ export async function reconcileSingleSettlement(
       });
     } catch (err) {
       if (
-        err instanceof Error &&
-        (err.message.includes("verification_failed") ||
-          err.message.includes("does not match") ||
-          err.message.includes("No payment operation") ||
-          err.message.includes("Horizon request failed"))
+        isVerificationFailure(err) ||
+        (err instanceof Error &&
+          (err.message.includes("verification_failed") ||
+            err.message.includes("Memo verification failed") ||
+            err.message.includes("does not match") ||
+            err.message.includes("No payment operation") ||
+            err.message.includes("Horizon request failed")))
       ) {
         await applySettlementTransition({
           settlementId: settlement.id,
@@ -120,10 +173,16 @@ export async function reconcileSingleSettlement(
         });
         await audit({
           userId: null,
+          groupId: settlement.groupId,
+          actorType: "worker",
           action: "settlement.verification_failed",
           entityType: "settlement",
           entityId: settlement.id,
-          metadata: { stellarTxHash: hash, reason: err.message },
+          metadata: {
+            stellarTxHash: hash,
+            reason: err.message,
+            ...memoFailureMetadata(err),
+          },
         });
         void dispatchEvent("settlement.failed", { settlementId: settlement.id, reason: err.message }, settlement.groupId)
           .catch(() => undefined);
@@ -148,6 +207,8 @@ export async function reconcileSingleSettlement(
     });
     await audit({
       userId: null,
+      groupId: settlement.groupId,
+      actorType: "worker",
       action: "settlement.completed",
       entityType: "settlement",
       entityId: settlement.id,
@@ -170,6 +231,8 @@ export async function reconcileSingleSettlement(
   });
   await audit({
     userId: null,
+    groupId: settlement.groupId,
+    actorType: "worker",
     action: "settlement.failed",
     entityType: "settlement",
     entityId: settlement.id,
@@ -181,13 +244,65 @@ export async function reconcileSingleSettlement(
   return "failed";
 }
 
+/** AppError codes that mean "this transaction can never verify" — terminal. */
+const VERIFICATION_FAILURE_CODES = new Set([
+  "TRANSACTION_VERIFICATION_FAILED",
+  "SETTLEMENT_VERIFICATION_FAILED",
+]);
+
+/**
+ * True for a verification failure raised by horizonService / this module.
+ *
+ * Classified by the stable error code rather than message text: a memo
+ * failure such as "Transaction has no memo" matches none of the message
+ * substrings above, and used to escape as an unexpected error — leaving the
+ * settlement in pending_confirmation to be re-checked against Horizon on
+ * every worker cycle instead of failing.
+ */
+function isVerificationFailure(err: unknown): err is AppError {
+  return err instanceof AppError && VERIFICATION_FAILURE_CODES.has(err.code);
+}
+
+/** `{ memoFailure }` when a verification error carries a memo failure reason. */
+function memoFailureMetadata(err: unknown): { memoFailure?: string } {
+  if (!(err instanceof AppError)) return {};
+  const reason = (err.details as { memoFailure?: unknown } | undefined)?.memoFailure;
+  return typeof reason === "string" ? { memoFailure: reason } : {};
+}
+
 async function handleTransactionNotFound(
-  settlement: { id: string; retryCount: number },
+  settlement: {
+    id: string;
+    groupId?: string;
+    retryCount: number;
+    status?: string;
+    pendingSince?: Date | null;
+  },
   hash: string,
   maxRetries: number,
   recLog: ReturnType<typeof loggerWithContext>
 ): Promise<SettlementReconciliationOutcome> {
   const nextRetryCount = settlement.retryCount + 1;
+
+  if (
+    settlement.pendingSince &&
+    Date.now() - settlement.pendingSince.getTime() >= config.WORKER_PENDING_SETTLEMENT_MAX_AGE_MS
+  ) {
+    await applySettlementTransition({
+      settlementId: settlement.id,
+      nextStatus: "expired",
+      source: "worker",
+      extraData: {
+        failureReason: `Transaction ${hash} was not found on Stellar before the pending limit expired`,
+        retryCount: nextRetryCount,
+      },
+    });
+    recLog.info(
+      { id: settlement.id, hash, pendingSince: settlement.pendingSince },
+      "settlement expired after remaining unconfirmed beyond the pending limit"
+    );
+    return "expired";
+  }
 
   if (nextRetryCount > maxRetries) {
     await applySettlementTransition({
@@ -201,6 +316,8 @@ async function handleTransactionNotFound(
     });
     await audit({
       userId: null,
+      groupId: settlement.groupId,
+      actorType: "worker",
       action: "settlement.reconciliation.exhausted",
       entityType: "settlement",
       entityId: settlement.id,
@@ -219,7 +336,15 @@ async function handleTransactionNotFound(
 
   await prisma.settlement.update({
     where: { id: settlement.id },
-    data: { retryCount: nextRetryCount },
+    data: {
+      retryCount: nextRetryCount,
+      // A needs_review row still without a Horizon answer is demoted to
+      // pending_confirmation, so the bounded retry budget above — not an
+      // unbounded needs_review wait — decides when enough silence is enough.
+      // A conditional updateMany is deliberately not needed here: the caller
+      // holds the row's lease, which already excludes concurrent writers.
+      ...(settlement.status === "needs_review" ? { status: "pending_confirmation" } : {}),
+    },
   });
   recLog.debug(
     { id: settlement.id, hash, attempt: nextRetryCount, maxRetries },

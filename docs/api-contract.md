@@ -1,5 +1,10 @@
 # Mergepay API contract reference
 
+Routes are served under the `/api/v1` prefix; path references below are written
+without it for brevity unless the full spelling is the point. The legacy root
+and `/api/…` spellings still route to the same handlers (see the API versioning
+section in [../README.md](../README.md#api-versioning)).
+
 The canonical client contract lives in `mergepay-web/src/lib/types.ts`. This file
 is the local reference for the parts of the contract that are defined by this
 repository, so a change here can be mirrored there in one step.
@@ -38,23 +43,50 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `IDEMPOTENCY_CONFLICT` | 409 | The key was already used with a different payload |
 | `IDEMPOTENCY_IN_PROGRESS` | 409 | The first request with this key is still running; retry shortly |
 | `UNAUTHORIZED` | 401 | Missing or invalid session |
+| `TOKEN_EXPIRED` | 401 | The session JWT's `exp` claim has passed — re-authenticate via SEP-10 or `POST /auth/refresh`; `details` carries a re-auth hint |
+| `INVALID_TOKEN` | 401 | The bearer token was rejected (malformed, wrong signature, wrong algorithm/issuer/audience) — re-authenticate via SEP-10; refresh cannot redeem it |
 | `FORBIDDEN` | 403 | Authenticated, but not permitted on this resource |
 | `NOT_FOUND` | 404 | The resource does not exist |
-| `RATE_LIMITED` | 429 | Per-route budget exhausted; `details.retryAfterSeconds` when available |
+| `RATE_LIMITED` | 429 | Per-route budget exhausted; the wait is in the `Retry-After` header |
+| `DUPLICATE_RECORD` | 409 | A unique constraint rejected the write; `details.fields` names the columns |
 | `UPSTREAM_ERROR` | 502 | Horizon or an anchor failed |
+| `SERVICE_UNAVAILABLE` | 503 | The database is unreachable, so the request could not be attempted |
 
 `404` versus `403` is deliberate and consistent: a resource that does not exist
 is `404`; one that exists but is not the caller's is `403`. Clients need to
 distinguish "gone" from "not yours" to render a useful state, and the difference
 leaks only the existence of an opaque identifier — never any content.
 
+### Database failures
+
+A statement PostgreSQL rejects is translated centrally, so a write that breaks a
+constraint reads as what it is rather than as an outage. Defined in
+[../src/lib/prisma-error.ts](../src/lib/prisma-error.ts).
+
+| Database failure | Status | Code |
+| --- | --- | --- |
+| Unique constraint (a value already exists) | 409 | `DUPLICATE_RECORD` |
+| Foreign key, value too long, null or missing required field, failed check constraint | 400 | `VALIDATION_ERROR` |
+| Required record not found | 404 | `NOT_FOUND` |
+| Write conflict or deadlock | 409 | `CONFLICT` |
+| Database unreachable, refused, or timed out | 503 | `SERVICE_UNAVAILABLE` |
+| A malformed statement of our own | 500 | `INTERNAL_ERROR` |
+
+`DUPLICATE_RECORD` carries `details.fields` — the columns whose unique index
+rejected the write — so a client can point at the offending input. Prisma's own
+message, the statement it was executing, and the Postgres constraint name are
+never sent: the message is fixed prose, and the driver's text and the constraint
+name go to the log instead.
+
 ---
 
 ## Pagination
 
-Applies to `GET /groups`, `/groups/:id/expenses`, `/groups/:id/settlements`, `/groups/:id/ledger`,
-`/groups/:id/treasury/history`, `/anchors/sessions`, and `/history`. Defined in
-[../src/lib/pagination.ts](../src/lib/pagination.ts).
+Applies to `GET /groups`, `/groups/:id`, `/groups/:id/expenses`, `/groups/:id/settlements`,
+`/groups/:id/ledger`, `/groups/:id/treasury/history`, `/groups/:groupId/treasury/proposals`,
+`/groups/:groupId/webhooks`, `/groups/:groupId/webhooks/:webhookId/deliveries`,
+`/anchors/sessions`, `/api/v1/sep24/transactions`, and `/history`.
+Defined in [../src/lib/pagination.ts](../src/lib/pagination.ts).
 
 ### Query parameters
 
@@ -91,6 +123,78 @@ Guarantees:
 `GET /history` paginates two resources independently: `cursor` walks the expense
 stream, `settlementCursor` walks the settlement stream, with metadata in `meta`
 and `settlementMeta` respectively.
+
+### Expense list filters (`GET /groups/:id/expenses`)
+
+The group expense list extends the shared pagination parameters with filters
+(defined in [../src/services/expenses.ts](../src/services/expenses.ts)). Filters
+compose with the cursor rather than replacing it, so a filtered scan pages
+exactly like an unfiltered one.
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `asset` | `"XLM"` \| `"USDC"` | Filter by asset code. Other codes are a `VALIDATION_ERROR` |
+| `status` | `"PENDING"` \| `"SETTLED"` | Settlement state of the whole expense: `SETTLED` requires every share settled, `PENDING` at least one outstanding |
+| `startDate` / `endDate` | ISO 8601 datetime | Inclusive `createdAt` bounds. A reversed range is `INVALID_RANGE`, not an empty page |
+| `includeTotal` | `"true"` \| `"false"` | Opt-in `meta.total` count. Counting a filtered set is a second query over every matching row, so clients that need a total ask for it explicitly |
+
+The count behind `includeTotal` covers the filters but not the cursor, so the
+total stays stable while a client pages through the result.
+
+### Settlement list filters (`GET /groups/:id/settlements`)
+
+Defined in [../src/services/settlement-history.ts](../src/services/settlement-history.ts).
+Same shape as the expense filters above, and the same composition with the
+cursor.
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `status` | one of the five public settlement statuses | Filters by the value [`GET /settlements/:id/status`](#get-settlementsidstatus) reports for the same row, not by the internal column |
+| `asset` | `"XLM"` \| `"USDC"` | Filter by asset code. Other codes are a `VALIDATION_ERROR` |
+| `startDate` / `endDate` | ISO 8601 datetime | Inclusive `createdAt` bounds. A reversed range is `INVALID_RANGE` |
+| `includeTotal` | `"true"` \| `"false"` | Opt-in `meta.total` over the filtered set, ignoring the cursor |
+
+Two of the five public statuses are *derived* from the signing deadline rather
+than stored — a row at `pending` or `submitted` past its `expiresAt` reports as
+`expired` — so the filter is written as the exact inverse of that mapping,
+including its clock-skew tolerance. Consequences a client can rely on:
+
+- the five values **partition** the history: every settlement matches exactly
+  one, so no row is unreachable and none appears under two filters;
+- a filtered row reports the **same status** when read individually through
+  `GET /settlements/:id/status`.
+
+### Ledger filters (`GET /groups/:id/ledger`)
+
+Defined in [../src/services/ledger.ts](../src/services/ledger.ts). The ledger
+interleaves expenses, settlements, and treasury transactions into one
+time-ordered feed.
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `type` | one or more of `expense`, `settlement`, `treasury` | Comma-separated (`?type=expense,settlement`). Selects which tables are read at all, so one kind means one query instead of three. An unknown kind is a `VALIDATION_ERROR` |
+| `startDate` / `endDate` | ISO 8601 datetime | Inclusive `createdAt` bounds, pushed into every table read. A reversed range is `INVALID_RANGE` |
+
+Both filters are applied inside each table's query rather than to the merged
+page. That is what keeps pages full: each table is read with its own
+`limit + 1` window, so dropping rows after the merge would return short pages
+and make `hasMore` describe the unfiltered scan.
+
+### Webhook delivery filters (`GET /groups/:groupId/webhooks/:webhookId/deliveries`)
+
+Defined in [../src/services/webhook-listing.ts](../src/services/webhook-listing.ts).
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `status` | `"pending"` \| `"delivered"` \| `"failed"` | Delivery state recorded by the worker |
+| `event` | a webhook event type | Filter to one event type |
+
+A delivery row also stores the exact signed request body and the receiver's
+response text. Neither is returned by this endpoint: the payload is the group's
+own data re-served through a different authorization path, and the response body
+is third-party text. The list returns `id`, `webhookId`, `eventType`, `status`,
+`attempts`, `responseStatusCode`, `nextAttemptAt`, `lastAttemptAt`, `createdAt`,
+and `updatedAt`.
 
 ---
 
@@ -219,6 +323,20 @@ envelope, its signatures, and any key material are never included in the
 response or in logs. A rejected transaction is never submitted and never
 advances the settlement's status — the settlement stays awaiting a signature and
 the wallet can sign the correct envelope instead.
+
+The same checks, in the same order, are available as a **non-throwing
+inspection** in
+[../src/services/xdr-inspection.ts](../src/services/xdr-inspection.ts), for
+callers that want the diverging field reported rather than raised —
+`inspectSignedTransaction` returns `{ ok: true, tx, hash, source, sequence }` or
+`{ ok: false, code, field, message }`, where `code` is one of `xdr_malformed`,
+`xdr_mismatch`, `intent_expired`, or `xdr_unsigned`, and `field` names the part
+of the envelope that diverged. It adds no rules of its own: it composes the same
+primitives the submission path uses, so there is exactly one description of what
+"matches the intent" means. Signature verification is on by default and can only
+be waived explicitly, for the paths where authorship is established elsewhere
+(an unsigned intent read back, or a multisig proposal whose shared source
+account never signs with its own key).
 
 ---
 
@@ -385,10 +503,14 @@ submission, and anchor routes each get their own bucket. See the table in
 [../README.md](../README.md#rate-limiting) and the policy definitions in
 [../src/lib/rate-limit.ts](../src/lib/rate-limit.ts).
 
-A 429 uses the standard error envelope with `error: "RATE_LIMITED"` and, where
-available, `details.retryAfterSeconds`, alongside the usual `Retry-After` and
-`X-RateLimit-*` headers. It reveals nothing about the caller's identity or
-whether a wallet account is known to the API.
+A 429 uses the standard error envelope with `error.code` / `code` set to
+`RATE_LIMITED`, alongside the usual `Retry-After` and `X-RateLimit-Limit` /
+`X-RateLimit-Remaining` / `X-RateLimit-Reset` headers. The body carries no
+`details`: how long to wait is a property of the limiter, not of the failed
+request, and repeating it in two places invites them to disagree. It also
+reveals nothing about the caller's identity or whether a wallet account is
+known to the API — `/auth/*` budgets are keyed by client IP precisely so that a
+429 cannot be used as an account oracle.
 
 ---
 

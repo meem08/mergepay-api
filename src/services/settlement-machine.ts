@@ -1,7 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db";
 import { AppError, Errors } from "../errors";
-import { auditTx } from "./audit";
+import { logActionTx } from "./audit";
 import { recordStatusTransitionInTransaction } from "./status-history";
 import { emitEvent, type WebhookEventType } from "./event";
 
@@ -12,6 +12,7 @@ export type SettlementStatus =
   | "pending_confirmation"
   | "confirmed"
   | "failed"
+  | "expired"
   | "needs_review";
 
 export type SettlementTransitionSource = "user" | "worker" | "system";
@@ -23,6 +24,7 @@ export const SETTLEMENT_STATUSES: readonly SettlementStatus[] = [
   "pending_confirmation",
   "confirmed",
   "failed",
+  "expired",
   "needs_review",
 ];
 
@@ -30,14 +32,21 @@ const ALLOWED_TRANSITIONS: Record<SettlementStatus, readonly SettlementStatus[]>
   pending: ["submitted", "failed"],
   submitted: ["verifying", "failed"],
   verifying: ["confirmed", "failed", "needs_review", "submitted"],
-  pending_confirmation: ["confirmed", "failed"],
+  pending_confirmation: ["confirmed", "failed", "expired"],
   confirmed: [],
   failed: [],
-  needs_review: ["confirmed", "failed"],
+  expired: [],
+  // needs_review means a submission's on-chain outcome could not be observed
+  // (Horizon had no record yet, or stopped answering) — never proof of payment
+  // or failure. The worker's reconciliation job keeps checking the recorded
+  // hash; when Horizon still has no answer, the row is demoted back to
+  // pending_confirmation so the bounded reconciliation retry budget — not an
+  // unbounded needs_review wait — decides when enough silence is enough.
+  needs_review: ["confirmed", "failed", "pending_confirmation", "expired"],
 };
 
 export function isTerminalSettlementStatus(status: string): boolean {
-  return status === "confirmed" || status === "failed";
+  return status === "confirmed" || status === "failed" || status === "expired";
 }
 
 export function isSettlementRecoverable(status: string): boolean {
@@ -89,6 +98,7 @@ export async function applySettlementTransition(params: ApplySettlementTransitio
       where: { id: settlementId },
       select: {
         id: true,
+        groupId: true,
         status: true,
         fromUserId: true,
         expenseShareId: true,
@@ -152,11 +162,16 @@ export async function applySettlementTransition(params: ApplySettlementTransitio
       select: { id: true, status: true, expenseShareId: true },
     });
 
-    await auditTx(client, {
-      userId: settlement.fromUserId,
+    await logActionTx(client, {
+      actorId: settlement.fromUserId,
+      groupId: settlement.groupId,
+      // `source` is the transition's own provenance and its values are exactly
+      // the actor vocabulary, so a worker's confirmation is recorded as the
+      // worker's act even though the row belongs to the payer.
+      actorType: source,
       action: "settlement.status_changed",
-      entityType: "settlement",
-      entityId: settlementId,
+      resourceType: "settlement",
+      resourceId: settlementId,
       metadata: {
         from: current,
         to: nextStatus,

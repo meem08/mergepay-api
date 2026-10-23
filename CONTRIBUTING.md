@@ -78,6 +78,22 @@ Expected: a JSON response with `status` and both dependency checks reporting liv
 Tests must run offline. Mock Prisma (`vi.mock("../src/db")`) and the Stellar
 service (`vi.mock("../src/services/stellar")`). Use `app.inject` for route tests.
 
+Rate limits stay enforced in tests, because the suites that assert them
+(`tests/rate-limit-*.test.ts`, `tests/integration/sep10-auth-rate-limit.test.ts`)
+only mean something against the real wiring. The budgets are small and they key
+on the authenticated *user*, not the client address, so a suite that reuses one
+`buildApp()` across a file cannot dodge them by rotating `remoteAddress`: it will
+eventually spend a tier and fail an unrelated assertion with a 429. A suite whose
+subject is not the limiter may boot without one:
+
+```ts
+const app = await buildApp({ rateLimit: "off" });
+```
+
+Use it for nothing else. Production callers pass no options and keep the default
+(`"enforced"`), and a suite testing throttling, the limit headers or the 429
+envelope must leave the limiter in place.
+
 ## Integration Tests
 
 Integration tests cover the full user journey from SEP-10 authentication through
@@ -95,6 +111,24 @@ group creation, expense addition, and settlement via the Stellar testnet.
    ```bash
    npm run test:integration
    ```
+
+### Database-backed tests
+
+The database-backed tests (`tests/integration/db/` holds the harness) need a
+Postgres but no running server and no network. `vitest.integration.config.ts`
+registers a global setup/teardown that provisions the schema and empties every
+table once per run, so the suite starts from a known-empty database instead of
+inheriting whatever the last run left:
+
+```bash
+createdb mergepay_test
+DATABASE_URL_TEST="postgresql://postgres@localhost:5432/mergepay_test" npm run test:integration
+```
+
+The schema is applied with `prisma db push` — the same command `npm run
+prisma:deploy` runs — because the committed migration history is not replayable
+onto a fresh database; see issue #646. CI provisions the database as a service
+container in the `integration` job.
 
 ### Integration Test Configuration
 

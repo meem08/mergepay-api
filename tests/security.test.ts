@@ -48,6 +48,26 @@ describe("Security headers middleware (Fastify Helmet)", () => {
     expect(csp).toContain("frame-ancestors 'none'");
   });
 
+  it("applies the same headers to API and root responses and hides x-powered-by", async () => {
+    // A real versioned API response (rejected for the missing token) and the
+    // root 404 both pass through the helmet onSend hook, so the headers are a
+    // property of the server rather than of one route.
+    const api = await app.inject({ method: "GET", url: "/api/v1/groups" });
+    expect(api.statusCode).toBe(401);
+
+    const root = await app.inject({ method: "GET", url: "/" });
+    expect(root.statusCode).toBe(404);
+
+    for (const res of [api, root]) {
+      expect(res.headers["x-content-type-options"]).toBe("nosniff");
+      expect(res.headers["x-frame-options"]).toBe("DENY");
+      expect(res.headers["strict-transport-security"]).toContain("max-age=31536000");
+      expect(res.headers["referrer-policy"]).toBe("no-referrer");
+      // Fastify advertises itself by default; helmet removes it.
+      expect(res.headers["x-powered-by"]).toBeUndefined();
+    }
+  });
+
   it("preserves Swagger UI documentation route accessibility", async () => {
     const docsHtmlRes = await app.inject({
       method: "GET",

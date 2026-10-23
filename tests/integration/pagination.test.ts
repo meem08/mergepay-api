@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll } from "vitest";
+import { describe, test, expect, beforeAll, beforeEach } from "vitest";
 import { Keypair } from "@stellar/stellar-sdk";
 import fetch from "node-fetch";
 import {
@@ -7,6 +7,7 @@ import {
   createGroup,
   createExpense,
   API_BASE_URL,
+  isLiveServerAvailable,
 } from "./helpers";
 
 const TEST_TIMEOUT = 30000;
@@ -18,13 +19,23 @@ describe.skipIf(!RUN_LIVE_INTEGRATION)("Pagination Integration Flow", () => {
   let adminToken: string;
   let adminKeypair: Keypair;
   let groupId: string;
+  let serverAvailable = false;
 
   beforeAll(async () => {
+    serverAvailable = await isLiveServerAvailable();
+    if (!serverAvailable) return;
+
     adminKeypair = await createTestAccount();
     adminToken = await authenticateUser(adminKeypair);
     const group = await createGroup(adminToken, "Pagination Test Group");
     groupId = group.id;
   }, TEST_TIMEOUT * 2);
+
+  beforeEach((ctx) => {
+    if (!serverAvailable) {
+      ctx.skip();
+    }
+  });
 
   test(
     "generates a large dataset and verifies predictable cursor pagination ordering",

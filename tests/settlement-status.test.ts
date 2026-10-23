@@ -237,11 +237,15 @@ describe("GET /settlements/:id/status — access", () => {
     expect(res.statusCode).toBe(403);
     const body = res.json();
     expect(body.error.code).toBe("FORBIDDEN");
-    // No amount, party, group, asset, or hash in the refusal. Use a distinctive
-    // amount string so generic metadata like the request id or timestamp cannot
-    // accidentally satisfy the leak check.
-    const serialized = JSON.stringify(body);
-    for (const leak of ["10.0000000", KEY_B, "group_1", "XLM", "ABC123"]) {
+    // No amount, party, group, asset, or hash in the refusal. requestId and
+    // timestamp are per-response metadata on every error envelope (at the top
+    // level and inside `error`) and are not settlement data — strip them
+    // wherever they appear, otherwise a short token like "10" spuriously
+    // matches a digit pair in the clock or a hex run in the id and flakes CI.
+    const serialized = JSON.stringify(body, (key, value) =>
+      key === "requestId" || key === "timestamp" ? undefined : value
+    );
+    for (const leak of ["10", KEY_B, "group_1", "XLM", "ABC123"]) {
       expect(serialized).not.toContain(leak);
     }
   });

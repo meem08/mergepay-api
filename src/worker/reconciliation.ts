@@ -1,11 +1,11 @@
-import pino from "pino";
 import { env } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
 import { type CorrelationContext, jobContext, loggerWithContext } from "../lib/correlation";
+import { createLogger } from "../lib/logger";
 
-const log = pino({ name: "transaction-reconciliation" });
+const log = createLogger({ name: "transaction-reconciliation" });
 
 type ReconciliationTable = "settlement" | "withdrawal" | "treasuryProposal";
 
@@ -15,6 +15,8 @@ type ReconciliationRecord = {
   stellarTxHash: string | null;
   updatedAt: Date;
   createdAt?: Date;
+  /** Present for `settlement` and `treasuryProposal`; `withdrawal` has no group. */
+  groupId?: string;
   expenseShareId?: string | null;
   retryCount?: number;
   ledger?: number | null;
@@ -184,6 +186,8 @@ async function writeStatus(
 
   await audit({
     userId: null,
+    groupId: record.groupId,
+    actorType: "worker",
     action: `stellar_transaction_${status}`,
     entityType: table,
     entityId: record.id,

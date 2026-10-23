@@ -73,6 +73,9 @@ const h = vi.hoisted(() => {
       updateMany: vi.fn(),
     },
     groupMember: { findUnique: vi.fn() },
+    // The execute route reads the group's `archived` flag (#648); an active
+    // group keeps these payer-member executions flowing.
+    group: { findUnique: vi.fn(async () => ({ archived: false })) },
     statusHistory: { create: vi.fn() },
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),

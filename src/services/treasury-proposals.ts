@@ -49,7 +49,8 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
-import { audit, auditTx } from "./audit";
+import { buildTreasuryPaymentXdr } from "./treasury-stellar";
+import { audit, auditMultisigActionTx } from "./audit";
 import { AuditAction } from "./audit-actions";
 
 export interface CreateProposalParams {
@@ -150,7 +151,7 @@ export const treasuryProposalsService = {
       }
 
       const textMemo = params.memo ?? `MP:${shortCodeRunes()}`;
-      xdr = stellar.buildPayment({
+      xdr = buildTreasuryPaymentXdr({
         sourcePublicKey: treasury.treasuryAccountPublicKey,
         sourceSequence: treasuryAcct.sequence,
         destination: params.destination,
@@ -192,15 +193,18 @@ export const treasuryProposalsService = {
           status: initialStatus,
         },
       });
-      await auditTx(tx, {
+      await auditMultisigActionTx(tx, {
         userId: params.creatorId,
         groupId: params.groupId,
         actorPublicKey: params.creatorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_CREATED,
-        entityType: "treasury_proposal",
-        entityId: created.id,
+        proposalId: created.id,
         metadata: {
           sourceAccount: treasury.treasuryAccountPublicKey,
+          // The hash of the exact unsigned envelope this proposal binds every
+          // later approval to. Recorded at creation so the audit trail can be
+          // tied to the on-chain intent without re-deriving it from the XDR.
+          txHash: created.txHash,
           destination: params.destination,
           amount: params.amount,
           assetCode: params.assetCode,
@@ -476,15 +480,17 @@ export const treasuryProposalsService = {
         // commit together. A failed audit write must roll back the mutation.
         for (const pk of verified.slice(stored.length).map((s) => s.publicKey)) {
           const signerUserId = memberUserIds.get(pk) ?? null;
-          await auditTx(tx, {
+          await auditMultisigActionTx(tx, {
             userId: signerUserId,
             groupId: proposal.groupId,
             actorPublicKey: pk,
             action: AuditAction.TREASURY_PROPOSAL_SIGNED,
-            entityType: "treasury_proposal",
-            entityId: proposal.id,
+            proposalId: proposal.id,
             metadata: {
               signerPublicKey: pk,
+              // The transaction the signature is bound to — the same hash
+              // every approval is verified against.
+              txHash: proposal.txHash,
               signatureCount: verified.length,
               threshold: proposal.threshold,
             },
@@ -561,12 +567,11 @@ export const treasuryProposalsService = {
           stellarTxHash: hash,
         },
       });
-      await auditTx(tx, {
+      await auditMultisigActionTx(tx, {
         groupId: proposal.groupId,
         actorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_SUBMITTED,
-        entityType: "treasury_proposal",
-        entityId: proposal.id,
+        proposalId: proposal.id,
         metadata: {
           sourceAccount: baseTx.source,
           signatureCount: storedSignatures.length,
@@ -586,12 +591,11 @@ export const treasuryProposalsService = {
         where: { id: proposal.id },
         data: { status: STATUS.failed, failureReason: msg },
       });
-      await auditTx(tx, {
+      await auditMultisigActionTx(tx, {
         groupId: proposal.groupId,
         actorPublicKey,
         action: AuditAction.TREASURY_PROPOSAL_FAILED,
-        entityType: "treasury_proposal",
-        entityId: proposal.id,
+        proposalId: proposal.id,
         outcome: "failure",
         metadata: {
           signatureCount: storedSignatures.length,

@@ -37,12 +37,13 @@
  * matters because anchors retry aggressively and give no ordering guarantee.
  */
 import crypto from "node:crypto";
-import { z } from "zod";
 import { config } from "../config";
 import { prisma } from "../db";
+import { sep24CallbackSchema, type Sep24Callback } from "../schemas/sep24";
 import { audit } from "./audit";
 import { mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
+import { sanitizeStatusReason } from "./sep24-status";
 
 /** Header carrying the anchor's HMAC-SHA256 signature over the raw body. */
 export const SEP24_SIGNATURE_HEADER = "x-sep24-signature";
@@ -57,60 +58,11 @@ export const SEP24_TIMESTAMP_HEADER = "x-sep24-timestamp";
 /** Signature encodings anchors are known to emit. */
 const SIGNATURE_PREFIX = "sha256=";
 
-/**
- * The SEP-24 transaction object, in both shapes anchors send it: wrapped in a
- * `transaction` envelope (the SEP-24 `GET /transaction` response shape, which
- * most anchors reuse for callbacks) or flattened at the top level.
- *
- * `passthrough` is deliberate — anchors add fields freely and an unrecognized
- * one must never reject an otherwise valid callback. Only what Mergepay reads
- * is validated.
- */
-const transactionFields = z.object({
-  id: z.string().min(1).max(255),
-  status: z.string().min(1).max(64),
-  kind: z.string().max(64).optional(),
-  amount_in: z.string().max(64).nullish(),
-  amount_out: z.string().max(64).nullish(),
-  amount_fee: z.string().max(64).nullish(),
-  stellar_transaction_id: z.string().max(128).nullish(),
-  external_transaction_id: z.string().max(255).nullish(),
-  message: z.string().max(1024).nullish(),
-});
-
-export const sep24CallbackSchema = z
-  .object({
-    transaction: transactionFields.passthrough().optional(),
-    id: z.string().min(1).max(255).optional(),
-    status: z.string().min(1).max(64).optional(),
-  })
-  .passthrough()
-  .transform((body, ctx) => {
-    const transaction = body.transaction;
-    const id = transaction?.id ?? body.id;
-    const status = transaction?.status ?? body.status;
-
-    if (!id || !status) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "SEP-24 callback must carry a transaction id and status, either at the top level or under `transaction`",
-      });
-      return z.NEVER;
-    }
-
-    return {
-      externalTransactionId: id,
-      rawStatus: status,
-      message: transaction?.message ?? null,
-      stellarTransactionId: transaction?.stellar_transaction_id ?? null,
-      amountIn: transaction?.amount_in ?? null,
-      amountOut: transaction?.amount_out ?? null,
-      amountFee: transaction?.amount_fee ?? null,
-    };
-  });
-
-export type Sep24Callback = z.infer<typeof sep24CallbackSchema>;
+// The callback payload contract lives in src/schemas/sep24.ts — the single
+// source of truth shared by every SEP-24 callback surface. It is re-exported
+// here so HMAC-authenticated callers keep one obvious import home.
+export { sep24CallbackSchema };
+export type { Sep24Callback };
 
 /** Why a callback was rejected. Never returned to the caller — logs only. */
 export type Sep24RejectionReason =
@@ -324,6 +276,7 @@ export async function applySep24Callback(
       nextStatus: status,
       source: "webhook",
       extraData: buildExtraData(callback),
+      reason: sanitizeStatusReason(callback.message),
     });
     if (result.changed) updated += 1;
   }
@@ -353,6 +306,10 @@ export async function applySep24Callback(
  */
 function buildExtraData(callback: Sep24Callback) {
   const extra: Record<string, unknown> = {};
-  if (callback.message) extra.failureReason = callback.message.slice(0, 500);
+  // Sanitized on the way in, not only on the way out: this column is returned
+  // to clients as `failureReason` on the session payload, and an anchor's
+  // message is untrusted text.
+  const reason = sanitizeStatusReason(callback.message);
+  if (reason) extra.failureReason = reason;
   return Object.keys(extra).length > 0 ? extra : undefined;
 }

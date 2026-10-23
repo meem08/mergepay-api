@@ -1,9 +1,9 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { config } from "../config";
 import { prisma } from "../db";
-import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { Errors } from "../errors";
-import { buildChallenge, verifyChallenge } from "../services/sep10";
+import { authenticateChallenge, buildChallenge } from "../services/sep10";
 import { signToken, requireUser } from "../plugins/auth";
 import { serializeUser } from "../serializers";
 import { audit } from "../services/audit";
@@ -15,7 +15,11 @@ import {
   unauthorizedForRefresh,
 } from "../services/refresh-token";
 import { rateLimited } from "../lib/rate-limit";
-import { sep10VerifyRequestSchema } from "../validations/sep10";
+import {
+  sep10ChallengeRequestSchema,
+  sep10QuerySchema,
+  sep10VerifyRequestSchema,
+} from "../validations/sep10";
 import { openApiBody, openApiEnvelope } from "../lib/openapi";
 
 function shortName(pk: string): string {
@@ -31,8 +35,19 @@ export default async function authRoutes(app: FastifyInstance) {
   // user yet, and the wallet's public key must never become a bucket key,
   // because differing 429 behaviour would then reveal whether an account is
   // known to the API.
+  // Their separate policy prefixes keep challenge traffic from spending the
+  // tighter verification budget.
   const challengeLimit = rateLimited("authChallenge");
   const verifyLimit = rateLimited("authVerify");
+
+  // Every body on this plugin is annotated with `enforce: false`: ajv is left
+  // describing the payload for the OpenAPI spec but not policing it, so a
+  // rejected body always comes back as one VALIDATION_ERROR carrying the
+  // message and `issues` the handler's Zod parse defined, rather than Fastify
+  // pre-empting it with ajv's wording on a subset of rules. The type keywords
+  // are kept — they are what makes the spec describe field types — and ajv's
+  // coercion is off factory-wide (see src/app.ts), so the value Zod judges is
+  // the value the client actually sent.
 
   app.post(
     "/auth/challenge",
@@ -43,7 +58,7 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Request SEP-10 challenge",
         description:
           "Builds an unsigned SEP-10 challenge transaction for the specified account, to be signed by the client wallet.",
-        body: openApiBody(z.object({ account: stellarAccountIdSchema })),
+        body: openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -57,7 +72,8 @@ export default async function authRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-      const body = z.object({ account: stellarAccountIdSchema }).parse(req.body);
+      sep10QuerySchema.parse(req.query);
+      const body = sep10ChallengeRequestSchema.parse(req.body);
       return buildChallenge(body.account);
     }
   );
@@ -70,8 +86,8 @@ export default async function authRoutes(app: FastifyInstance) {
         tags: ["Auth"],
         summary: "Verify SEP-10 challenge transaction",
         description:
-          "Verifies the client signature on a SEP-10 challenge transaction and issues JWT access and refresh tokens.",
-        body: openApiBody(sep10VerifyRequestSchema),
+          "Verifies the client signature on a SEP-10 challenge transaction and issues JWT access and refresh tokens. The optional `home_domain` must name the domain this server authenticates; `client_domain` is not supported here and is rejected rather than ignored.",
+        body: openApiBody(sep10VerifyRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -87,8 +103,48 @@ export default async function authRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
+      sep10QuerySchema.parse(req.query);
       const body = sep10VerifyRequestSchema.parse(req.body);
-      const publicKey = await verifyChallenge(body.transaction);
+
+      // SEP-10 lets a client name the domains it authenticated against, and
+      // this schema has always accepted `home_domain` / `client_domain` as
+      // well-formed values — then dropped them. A client that sends them is
+      // making a claim about the flow, so the claim is now answered here,
+      // before any envelope is parsed, any signature checked, and above all
+      // before this server's challenge is consumed:
+      //
+      //   - `client_domain`: this server does not do client-domain
+      //     verification at all (src/services/sep10.ts rejects an envelope
+      //     carrying the operation). Accepting the field while never performing
+      //     the check is how a wallet integration ends up *believing* it has
+      //     one. Rejected outright, so the answer is explicit.
+      //   - `home_domain`: challenges are issued for exactly one domain,
+      //     `config.SEP10_HOME_DOMAIN`. A request naming another is a client
+      //     mistake — the envelope check would reject it anyway, as an opaque
+      //     401 — so it is named here instead, as a 400 that says what to fix.
+      //
+      // These are 400s about the *request*, raised before any credential is
+      // evaluated, so they add no probe into how the signature itself failed.
+      const clientDomain = body.client_domain ?? body.clientDomain;
+      if (clientDomain !== undefined) {
+        throw Errors.badRequest(
+          "client_domain_unsupported",
+          "This server does not support SEP-10 client_domain authentication"
+        );
+      }
+      if (
+        body.home_domain !== undefined &&
+        body.home_domain.toLowerCase() !== config.SEP10_HOME_DOMAIN.toLowerCase()
+      ) {
+        throw Errors.badRequest(
+          "home_domain_mismatch",
+          `home_domain must match the domain this server issues challenges for (${config.SEP10_HOME_DOMAIN})`
+        );
+      }
+
+      const { account: publicKey, challengeHash } = await authenticateChallenge(
+        body.transaction
+      );
 
       const user = await prisma.user.upsert({
         where: { stellarPublicKey: publicKey },
@@ -99,9 +155,12 @@ export default async function authRoutes(app: FastifyInstance) {
         },
       });
 
-      // The claims contract is unchanged by SEP-10 hardening: verification
-      // still yields a public key, and the session is still minted here.
-      const token = signToken({ id: user.id, stellarPublicKey: publicKey });
+      // Session claims are unchanged; SEP-10 adds only `jti`, the hash of the
+      // challenge this login redeemed.
+      const token = signToken(
+        { id: user.id, stellarPublicKey: publicKey },
+        { jwtid: challengeHash }
+      );
       // A fresh family per login, so revoking one compromised session does
       // not sign the user out of their other devices.
       const refresh = await issueRefreshToken(user.id);
@@ -140,7 +199,9 @@ export default async function authRoutes(app: FastifyInstance) {
         summary: "Exchange refresh token for access token",
         description:
           "Exchanges a valid refresh token for a new access token and rotated refresh token.",
-        body: openApiBody(z.object({ refreshToken: z.string().min(1).max(512) })),
+        body: openApiBody(z.object({ refreshToken: z.string().min(1).max(512) }), {
+          enforce: false,
+        }),
         response: {
           200: {
             type: "object",
@@ -216,6 +277,11 @@ export default async function authRoutes(app: FastifyInstance) {
   app.post(
     "/auth/logout",
     {
+      // Keyed by IP on `onRequest`: the handler deliberately answers `ok` for
+      // an absent or invalid token, so there is no identity to key by, and
+      // every accepted call revokes a user's refresh tokens and writes an
+      // audit row.
+      ...rateLimited("authLogout"),
       schema: {
         tags: ["Auth"],
         summary: "Log out user session",
@@ -286,7 +352,8 @@ export default async function authRoutes(app: FastifyInstance) {
           z.object({
             displayName: z.string().min(1).max(40).optional(),
             avatarUrl: z.string().url().nullable().optional(),
-          })
+          }),
+          { enforce: false }
         ),
         response: openApiEnvelope("user"),
       },

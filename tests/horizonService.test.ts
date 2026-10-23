@@ -10,6 +10,11 @@ vi.mock("../src/config", () => ({
   config: {
     HORIZON_STATUS_TIMEOUT_MS: h.HORIZON_STATUS_TIMEOUT_MS,
     HORIZON_URL: "https://horizon-testnet.stellar.org",
+    // Issue #531: the Horizon query reads retry transient failures; the
+    // budget is configurable via these documented variables.
+    HORIZON_READ_RETRY_MAX_ATTEMPTS: 3,
+    HORIZON_READ_RETRY_INITIAL_DELAY_MS: 0,
+    HORIZON_READ_RETRY_MAX_DELAY_MS: 0,
     isTest: true,
   },
 }));
@@ -36,11 +41,13 @@ vi.mock("@stellar/stellar-sdk", () => {
   };
 });
 
-vi.mock("../src/services/timeout", () => ({
-  withTimeout: vi.fn((_name: string, _ms: number, fn: () => any) => fn()),
-  TimeoutError: class TimeoutError extends Error {},
-  TransportError: class TransportError extends Error {},
-}));
+vi.mock("../src/services/timeout", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/services/timeout")>();
+  return {
+    ...actual,
+    withTimeout: vi.fn((_name: string, _ms: number, fn: () => any) => fn()),
+  };
+});
 
 import {
   verifyTransactionMemo,
@@ -59,7 +66,7 @@ function makeTxRecord(over: Partial<HorizonTransactionRecord> = {}): HorizonTran
   return {
     hash: "abc123def456",
     successful: true,
-    memo: "MP:ABC123",
+    memo: "MP:ABC234",
     memo_type: "text",
     source_account: "GFROM...",
     fee_charged: 100,
@@ -137,12 +144,31 @@ describe("getTransactionFromHorizon", () => {
     );
   });
 
-  it("wraps generic errors in Errors.upstream", async () => {
+  it("categorizes generic provider errors without exposing upstream messages", async () => {
     h.mockTransactionCall.mockRejectedValue(new Error("Horizon request failed: connection timeout"));
 
-    await expect(getTransactionFromHorizon("tx_hash_generic")).rejects.toThrow(
-      "Horizon request failed: connection timeout"
-    );
+    await expect(getTransactionFromHorizon("tx_hash_generic")).rejects.toMatchObject({
+      name: "ProviderError",
+      category: "unavailable",
+      provider: "horizon",
+      operation: "Horizon.getTransactionDetails",
+      message: "Horizon request failed",
+    });
+  });
+
+  it("categorizes rejected transactions and retains safe result codes", async () => {
+    h.mockTransactionCall.mockRejectedValue(Object.assign(new Error("Transaction failed"), {
+      response: {
+        status: 400,
+        data: { extras: { result_codes: { transaction_result_code: "tx_failed" } } },
+      },
+    }));
+
+    await expect(getTransactionFromHorizon("tx_hash_rejected")).rejects.toMatchObject({
+      name: "ProviderError",
+      category: "rejected",
+      detail: ["tx_failed"],
+    });
   });
 });
 
@@ -155,13 +181,34 @@ describe("getTransactionPayments", () => {
     vi.clearAllMocks();
   });
 
-  it("returns payment operations", async () => {
-    const op = makePaymentOp();
-    h.mockPaymentsCall.mockResolvedValue({ records: [op, { type: "manage_data" }] });
+  it("returns payment operations, mapping Horizon's `to` onto the app's `destination`", async () => {
+    // Horizon's payment operation carries `from`/`to`, not `destination`.
+    // The raw record is shaped exactly as Horizon returns it so the mapping is
+    // what this assertion pins down; a record already using `destination`
+    // would pass even if the translation were dropped.
+    const horizonOp = {
+      type: "payment",
+      from: "GFROM...",
+      to: "GTO...",
+      amount: "10.0000000",
+      asset_type: "native",
+      source_account: "GFROM...",
+    };
+    h.mockPaymentsCall.mockResolvedValue({ records: [horizonOp, { type: "manage_data" }] });
 
     const result = await getTransactionPayments("tx_hash_1");
 
-    expect(result).toEqual([op]);
+    expect(result).toEqual([
+      {
+        type: "payment",
+        destination: "GTO...",
+        amount: "10.0000000",
+        asset_type: "native",
+        asset_code: undefined,
+        asset_issuer: undefined,
+        source_account: "GFROM...",
+      },
+    ]);
   });
 
   it("returns empty array when no payment ops", async () => {
@@ -184,12 +231,70 @@ describe("verifyTransactionMemo — valid MP: memo", () => {
 
   it("returns verified:true when memo matches", async () => {
     h.mockTransactionCall.mockResolvedValue(
-      makeTxRecord({ memo: "MP:ABC123", memo_type: "text" })
+      makeTxRecord({ memo: "MP:ABC234", memo_type: "text" })
     );
 
-    const result = await verifyTransactionMemo("tx_hash_1", "MP:ABC123");
+    const result = await verifyTransactionMemo("tx_hash_1", "MP:ABC234");
 
-    expect(result).toEqual({ verified: true });
+    expect(result).toEqual({ verified: true, memo: "MP:ABC234", code: "ABC234" });
+  });
+});
+
+describe("verifyTransactionMemo — robust memo validation (#506)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function rejection(record: Partial<HorizonTransactionRecord>, expected = "MP:ABC234") {
+    h.mockTransactionCall.mockResolvedValue(makeTxRecord(record));
+    return verifyTransactionMemo("tx_hash_506", expected).then(
+      () => {
+        throw new Error("expected verifyTransactionMemo to reject");
+      },
+      (err: any) => err
+    );
+  }
+
+  it.each([
+    ["missing memo", { memo: undefined, memo_type: "none" }, "missing_memo"],
+    ["empty text memo", { memo: "", memo_type: "text" }, "missing_memo"],
+    ["malformed text memo", { memo: "mp:abc234", memo_type: "text" }, "malformed_memo"],
+    ["non-MP text memo", { memo: "invoice 42", memo_type: "text" }, "malformed_memo"],
+    ["mismatched MP code", { memo: "MP:XYZ234", memo_type: "text" }, "code_mismatch"],
+    [
+      "well-formed hash memo",
+      { memo: Buffer.alloc(32, 9).toString("base64"), memo_type: "hash" },
+      "hash_memo_mismatch",
+    ],
+    ["malformed hash memo", { memo: "abc", memo_type: "hash" }, "invalid_hash_memo"],
+    ["id memo", { memo: "12345", memo_type: "id" }, "unsupported_memo_type"],
+    [
+      "return memo",
+      { memo: Buffer.alloc(32).toString("base64"), memo_type: "return" },
+      "unsupported_memo_type",
+    ],
+  ])("rejects a %s with TRANSACTION_VERIFICATION_FAILED and a typed reason", async (_l, record, reason) => {
+    const err = await rejection(record);
+    expect(err).toMatchObject({
+      status: 400,
+      code: "TRANSACTION_VERIFICATION_FAILED",
+      details: { memoFailure: reason },
+    });
+  });
+
+  it("rejects an invalid expected memo before calling Horizon", async () => {
+    await expect(verifyTransactionMemo("tx_hash_bad_expected", "MP:")).rejects.toMatchObject({
+      code: "TRANSACTION_VERIFICATION_FAILED",
+      message: expect.stringContaining("Expected memo is not a valid Mergepay reference"),
+    });
+    expect(h.mockTransactionCall).not.toHaveBeenCalled();
+  });
+
+  it("returns the memo read from the ledger", async () => {
+    h.mockTransactionCall.mockResolvedValue(makeTxRecord({ memo: "MP:ABC234" }));
+    await expect(verifyTransactionMemo("tx_hash_ok", "MP:ABC234")).resolves.toMatchObject({
+      memo: "MP:ABC234",
+    });
   });
 });
 
@@ -200,10 +305,10 @@ describe("verifyTransactionMemo — memo mismatch", () => {
 
   it("throws transaction_verification_failed when memo differs", async () => {
     h.mockTransactionCall.mockResolvedValue(
-      makeTxRecord({ memo: "MP:DIFFERENT", memo_type: "text" })
+      makeTxRecord({ memo: "MP:XYZ789", memo_type: "text" })
     );
 
-    await expect(verifyTransactionMemo("tx_hash_2", "MP:ABC123")).rejects.toThrow(
+    await expect(verifyTransactionMemo("tx_hash_2", "MP:ABC234")).rejects.toThrow(
       "Transaction memo does not match the expected settlement reference"
     );
   });
@@ -219,7 +324,7 @@ describe("verifyTransactionMemo — missing memo", () => {
       makeTxRecord({ memo: undefined, memo_type: "none" })
     );
 
-    await expect(verifyTransactionMemo("tx_hash_3", "MP:ABC123")).rejects.toThrow(
+    await expect(verifyTransactionMemo("tx_hash_3", "MP:ABC234")).rejects.toThrow(
       "Transaction has no memo"
     );
   });
@@ -235,7 +340,7 @@ describe("verifyTransactionMemo — wrong memo type", () => {
       makeTxRecord({ memo: "12345", memo_type: "id" })
     );
 
-    await expect(verifyTransactionMemo("tx_hash_4", "MP:ABC123")).rejects.toThrow(
+    await expect(verifyTransactionMemo("tx_hash_4", "MP:ABC234")).rejects.toThrow(
       'Unexpected memo type: expected "text", got "id"'
     );
   });
@@ -245,7 +350,7 @@ describe("verifyTransactionMemo — wrong memo type", () => {
       makeTxRecord({ memo: undefined, memo_type: "hash" })
     );
 
-    await expect(verifyTransactionMemo("tx_hash_4b", "MP:ABC123")).rejects.toThrow(
+    await expect(verifyTransactionMemo("tx_hash_4b", "MP:ABC234")).rejects.toThrow(
       'Unexpected memo type: expected "text", got "hash"'
     );
   });
@@ -261,7 +366,7 @@ describe("verifyTransactionMemo — failed transaction", () => {
       makeTxRecord({ successful: false })
     );
 
-    await expect(verifyTransactionMemo("tx_hash_5", "MP:ABC123")).rejects.toThrow(
+    await expect(verifyTransactionMemo("tx_hash_5", "MP:ABC234")).rejects.toThrow(
       "Transaction was not successful on Stellar"
     );
   });
@@ -275,7 +380,7 @@ describe("verifyTransactionMemo — transaction not found", () => {
   it("throws not_found when transaction does not exist", async () => {
     h.mockTransactionCall.mockResolvedValue(null);
 
-    await expect(verifyTransactionMemo("tx_hash_6", "MP:ABC123")).rejects.toThrow(
+    await expect(verifyTransactionMemo("tx_hash_6", "MP:ABC234")).rejects.toThrow(
       "Transaction not found on Horizon"
     );
   });
@@ -291,9 +396,11 @@ describe("verifyTransactionMemo — Horizon network error", () => {
       new Error("Horizon request failed: connection timeout")
     );
 
-    await expect(verifyTransactionMemo("tx_hash_7", "MP:ABC123")).rejects.toThrow(
-      "Horizon request failed: connection timeout"
-    );
+    await expect(verifyTransactionMemo("tx_hash_7", "MP:ABC234")).rejects.toMatchObject({
+      name: "ProviderError",
+      category: "unavailable",
+      provider: "horizon",
+    });
   });
 });
 

@@ -1,4 +1,4 @@
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { timingSafeEqual } from "node:crypto";
 import { prisma } from "../db";
@@ -13,8 +13,7 @@ import {
 } from "../services/withdrawal-status";
 import { auditTx } from "../services/audit";
 import { rateLimited } from "../lib/rate-limit";
-import { ipKey } from "../services/rate-limit-keys";
-import { safeFailureMessage } from "../services/job-retry";
+import { applySep24Callback } from "../services/sep24";
 import {
   paginationQuerySchema,
   buildPage,
@@ -24,11 +23,14 @@ import {
   takeForPage,
 } from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
+import { getStatusHistory } from "../services/status-history";
 import { validateAsset } from "../services/assets";
 import {
   sep24DepositRequestSchema,
+  sep24InitQuerySchema,
   sep24WithdrawRequestSchema,
 } from "../validations/sep24";
+import { sep24CallbackSchema } from "../schemas/sep24";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
@@ -98,16 +100,24 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // -- start deposit / withdraw -----------------------------------------------
   async function start(
     kind: "deposit" | "withdrawal",
-    req: any,
+    req: FastifyRequest,
     requestSchema = kind === "deposit"
       ? sep24DepositRequestSchema
       : sep24WithdrawRequestSchema
   ) {
     const auth = requireUser(req);
+    // Query first, then body: both are Zod-owned, and both run before the
+    // anchor is contacted, so a malformed request never reaches an upstream
+    // call, the database, or the audit log.
+    sep24InitQuerySchema.parse(req.query ?? {});
     const body = requestSchema.parse(req.body);
 
-    // Validate that the requested asset is supported.
-    validateAsset(body.assetCode);
+    // Validate that the requested asset is supported. The issuer is part of
+    // the request contract, so it is validated *with* the code rather than
+    // dropped: a caller naming an issuer Mergepay does not issue that asset
+    // under would otherwise get a session created against a different asset
+    // than the one it asked for.
+    validateAsset(body.assetCode, body.assetIssuer);
 
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
     const challenge = await anchorService.getChallenge(
@@ -151,7 +161,11 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive deposit",
         description:
           "Initiates a SEP-24 interactive deposit session and returns an anchor auth challenge.",
-        body: openApiBody(sep24DepositRequestSchema),
+        // Documented from the same Zod schema the handler parses with, but with
+        // the rules stripped: the handler is the only validator, so a rejection
+        // arrives in the documented VALIDATION_ERROR envelope with `issues`.
+        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
+        body: openApiBody(sep24DepositRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -177,7 +191,8 @@ export default async function anchorRoutes(app: FastifyInstance) {
         summary: "Initiate SEP-24 interactive withdrawal",
         description:
           "Initiates a SEP-24 interactive withdrawal session and returns an anchor auth challenge.",
-        body: openApiBody(sep24WithdrawRequestSchema),
+        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
+        body: openApiBody(sep24WithdrawRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -205,14 +220,26 @@ export default async function anchorRoutes(app: FastifyInstance) {
         description:
           "Exchanges signed SEP-10 challenge for an anchor JWT and returns the SEP-24 interactive URL.",
         params: openApiIdParams(),
-        body: openApiBody(z.object({ signedXdr: z.string().min(1) })),
-        response: openApiEnvelope("session"),
+        body: openApiBody(z.object({ signedXdr: z.string().min(1) }).strict()),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "url", "id", "session"],
+            properties: {
+              type: { type: "string", enum: ["interactive"] },
+              url: { type: "string", format: "uri" },
+              id: { type: "string" },
+              session: { type: "object", additionalProperties: true },
+            },
+          },
+        },
       },
     },
     async (req) => {
       const auth = requireUser(req);
       const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
-      const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+      const body = z.object({ signedXdr: z.string().min(1) }).strict().parse(req.body);
 
       const session = await prisma.anchorSession.findUnique({
         where: { id },
@@ -245,7 +272,12 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       });
 
-      return { session: serializeAnchorSession(updated) };
+      return {
+        type: "interactive" as const,
+        url: interactive.url,
+        id: interactive.id,
+        session: serializeAnchorSession(updated),
+      };
     }
   );
 
@@ -254,6 +286,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
     "/anchors/sessions",
     {
       preHandler: [app.authenticate],
+      ...pollLimit,
       schema: {
         tags: ["SEP-24"],
         summary: "List user anchor sessions",
@@ -319,7 +352,17 @@ export default async function anchorRoutes(app: FastifyInstance) {
         throw Errors.notFound("Anchor session not found");
       }
 
-      return { session: serializeAnchorSession(session) };
+      // The timeline lives in `status_history`, keyed by (entityType, entityId)
+      // rather than by a Prisma relation, so nothing reads it back on the
+      // session query itself. Without this the route answered every poll with
+      // an empty history, which is a claim about the transaction, not an
+      // absence of data.
+      const history = await getStatusHistory({
+        entityType: "anchor_session",
+        entityId: session.id,
+      });
+
+      return { session: serializeAnchorSession({ ...session, statusHistory: history }) };
     }
   );
 
@@ -330,23 +373,21 @@ export default async function anchorRoutes(app: FastifyInstance) {
   app.post(
     "/anchors/webhook",
     {
-      config: {
-        rateLimit: {
-          max: config.SEP24_RATE_LIMIT_MAX,
-          timeWindow: config.RATE_LIMIT_WINDOW_MS,
-          keyGenerator: ipKey("anchor.webhook"),
-        },
-      },
+      ...rateLimited("anchorWebhook"),
       schema: {
         tags: ["SEP-24"],
         summary: "Anchor status webhook",
         description: "Receives signed webhook status notifications from SEP-24 anchors.",
+        body: openApiBody(sep24CallbackSchema),
         response: {
           200: {
             type: "object",
             additionalProperties: true,
             properties: {
-              ok: { type: "boolean" },
+              received: { type: "boolean" },
+              status: { type: "string" },
+              matched: { type: "integer" },
+              updated: { type: "integer" },
             },
           },
         },
@@ -358,60 +399,32 @@ export default async function anchorRoutes(app: FastifyInstance) {
       if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
-      const body = z
-        .object({
-          transaction: z
-            .object({ id: z.string(), status: z.string(), message: z.string().optional() })
-            .optional(),
-          id: z.string().optional(),
-          status: z.string().optional(),
-          message: z.string().optional(),
-        })
-        .passthrough()
-        .parse(req.body ?? {});
 
-      const externalId = body.transaction?.id ?? body.id;
-      const status = body.transaction?.status ?? body.status;
-      if (externalId && status) {
-        const mappedStatus = mapAnchorStatus(status);
-        const rawMessage = body.transaction?.message ?? body.message;
-        const sanitizedMessage = typeof rawMessage === "string" ? safeFailureMessage(rawMessage) : null;
+      const callback = sep24CallbackSchema.parse(req.body ?? {});
+      const result = await applySep24Callback(callback);
 
-        const sessions = await prisma.anchorSession.findMany({
-          where: { externalTransactionId: externalId },
+      const withdrawal = await prisma.withdrawal.findUnique({
+        where: { anchorTxId: callback.externalTransactionId },
+      });
+      if (withdrawal) {
+        await applyWithdrawalTransition({
+          withdrawalId: withdrawal.id,
+          nextStatus: mapAnchorStatusToWithdrawalStatus(
+            mapAnchorStatus(callback.rawStatus)
+          ),
+          source: "webhook",
         });
-        for (const session of sessions) {
-          // applyAnchorSessionTransition atomically validates the transition
-          // against the finite state map and writes its audit record in the
-          // same database transaction as the status change — see
-          // src/services/anchor-status.ts. An out-of-order or duplicate
-          // webhook delivery is a no-op rather than a regression.
-          await applyAnchorSessionTransition({
-            sessionId: session.id,
-            nextStatus: mappedStatus,
-            source: "webhook",
-            extraData: mappedStatus === "error" ? {
-              failureReason: sanitizedMessage,
-            } : undefined,
-          });
-        }
-
-        // The simpler `Withdrawal` record (POST /withdraw) is a separate
-        // table keyed by the same anchor transaction id — see
-        // src/services/withdrawal-status.ts for why it has its own status
-        // vocabulary and transition map.
-        const withdrawal = await (prisma as any).withdrawal.findUnique({
-          where: { anchorTxId: externalId },
-        });
-        if (withdrawal) {
-          await applyWithdrawalTransition({
-            withdrawalId: withdrawal.id,
-            nextStatus: mapAnchorStatusToWithdrawalStatus(mappedStatus),
-            source: "webhook",
-          });
-        }
       }
-      return reply.code(200).send({ ok: true });
+
+      // 200 regardless of whether a session matched or the transition applied:
+      // anchors retry non-2xx responses, and re-delivering a callback that was
+      // correctly processed as a no-op only amplifies load.
+      return reply.code(200).send({
+        received: true,
+        status: result.status,
+        matched: result.matched,
+        updated: result.updated,
+      });
     }
   );
 }
