@@ -7,9 +7,10 @@
  * never valid to begin with (stop sending it):
  *
  *   - expired / inside the expiry margin → 401 `TOKEN_EXPIRED` + a hint
- *   - malformed, wrong signature, wrong issuer/audience/algorithm,
- *     not-yet-valid, or missing claims → 401 `INVALID_TOKEN`
- *   - no Authorization header, or not a Bearer scheme → 401 `UNAUTHORIZED`
+ *   - wrong signature, wrong issuer/audience/algorithm, not-yet-valid, or
+ *     missing claims → 401 `INVALID_TOKEN`
+ *   - not a JWT at all, or not a Bearer scheme → 401 `MALFORMED_TOKEN` (#925)
+ *   - no Authorization header → 401 `MISSING_TOKEN` (#925)
  *   - a valid token proceeds normally
  *
  * Unit tests cover `verifyToken` directly; route tests exercise the full
@@ -113,7 +114,7 @@ describe("verifyToken — classification", () => {
       const err = error as AppError;
       expect(err.code).toBe("TOKEN_EXPIRED");
       expect(err.status).toBe(401);
-      expect(err.message).toBe("Token expired");
+      expect(err.message).toBe("Authentication token has expired");
     }
   });
 
@@ -141,9 +142,9 @@ describe("verifyToken — classification", () => {
     );
   });
 
-  it("classifies a malformed token as INVALID_TOKEN", () => {
+  it("classifies a malformed token as MALFORMED_TOKEN", () => {
     expect(() => verifyToken("not-a-jwt")).toThrow(
-      expect.objectContaining({ code: "INVALID_TOKEN" })
+      expect.objectContaining({ code: "MALFORMED_TOKEN" })
     );
   });
 
@@ -219,15 +220,14 @@ describe("authenticated route — 401 contract", () => {
     expect(res.json().user.id).toBe(USER_ID);
   });
 
-  it("returns UNAUTHORIZED when no token is presented", async () => {
+  it("returns MISSING_TOKEN when no token is presented", async () => {
     const res = await app.inject({ method: "GET", url: "/me" });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("UNAUTHORIZED");
-       expect(res.json().error.code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("MISSING_TOKEN");
   });
 
-  it("returns UNAUTHORIZED when the Authorization header is not Bearer", async () => {
+  it("returns MALFORMED_TOKEN when the Authorization header is not Bearer", async () => {
     const res = await app.inject({
       method: "GET",
       url: "/me",
@@ -235,7 +235,7 @@ describe("authenticated route — 401 contract", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("MALFORMED_TOKEN");
   });
 
   it("returns TOKEN_EXPIRED with a re-authentication hint for an expired token", async () => {
@@ -293,13 +293,13 @@ describe("authenticated route — 401 contract", () => {
     const body = res.json();
       expect(body.error.code).toBe("INVALID_TOKEN");
     expect(body.code).toBe("INVALID_TOKEN");
-    expect(body.message).toBe("Invalid token");
+    expect(body.message).toBe("Authentication token is invalid");
     expect(body.requestId).toBeTruthy();
     // An unverifiable credential is not recoverable by refreshing.
       expect(body.error.details?.hint).toBeUndefined();
   });
 
-  it("returns INVALID_TOKEN for a malformed bearer token", async () => {
+  it("returns MALFORMED_TOKEN for a malformed bearer token", async () => {
     const res = await app.inject({
       method: "GET",
       url: "/me",
@@ -307,7 +307,7 @@ describe("authenticated route — 401 contract", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("INVALID_TOKEN");
+    expect(res.json().error.code).toBe("MALFORMED_TOKEN");
   });
 
   it("keeps the error envelope stack-free", async () => {
@@ -332,7 +332,15 @@ describe("authenticated route — 401 contract", () => {
     const invalid = await app.inject({
       method: "GET",
       url: "/me",
-      headers: { authorization: `Bearer ${signWith({}, {})}`.replace(signWith({}, {}), "garbage.token.value") },
+      // Well-formed, but signed with a key this server does not hold.
+      headers: {
+        authorization: `Bearer ${jwt.sign({ sub: USER_ID, pk: PUBLIC_KEY }, "wrong-secret-entirely", {
+          algorithm: "HS256",
+          issuer: config.JWT_ISSUER,
+          audience: config.JWT_AUDIENCE,
+          expiresIn: "15m",
+        })}`,
+      },
     });
 
     expect(expired.json().code).toBe("TOKEN_EXPIRED");

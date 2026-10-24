@@ -466,7 +466,7 @@ describe("POST /treasury/propose", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("MISSING_TOKEN");
   });
 });
 

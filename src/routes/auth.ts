@@ -20,7 +20,7 @@ import {
   sep10QuerySchema,
   sep10VerifyRequestSchema,
 } from "../validations/sep10";
-import { openApiBody, openApiEnvelope } from "../lib/openapi";
+import { openApiBody, openApiEnvelope, openApiErrorResponses, openApiOkResponse, openApiResponse } from "../lib/openapi";
 
 function shortName(pk: string): string {
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
@@ -60,14 +60,11 @@ export default async function authRoutes(app: FastifyInstance) {
           "Builds an unsigned SEP-10 challenge transaction for the specified account, to be signed by the client wallet.",
         body: openApiBody(sep10ChallengeRequestSchema, { enforce: false }),
         response: {
-          200: {
-            type: "object",
-            additionalProperties: true,
-            properties: {
-              transaction: { type: "string" },
-              networkPassphrase: { type: "string" },
-            },
-          },
+          ...openApiResponse({
+            transaction: { type: "string" },
+            networkPassphrase: { type: "string" },
+          }),
+          ...openApiErrorResponses(400, 429),
         },
       },
     },
@@ -89,16 +86,13 @@ export default async function authRoutes(app: FastifyInstance) {
           "Verifies the client signature on a SEP-10 challenge transaction and issues JWT access and refresh tokens. The optional `home_domain` must name the domain this server authenticates; `client_domain` is not supported here and is rejected rather than ignored.",
         body: openApiBody(sep10VerifyRequestSchema, { enforce: false }),
         response: {
-          200: {
-            type: "object",
-            additionalProperties: true,
-            properties: {
-              token: { type: "string" },
-              refreshToken: { type: "string" },
-              refreshTokenExpiresAt: { type: "string" },
-              user: { type: "object", additionalProperties: true },
-            },
-          },
+          ...openApiResponse({
+            token: { type: "string" },
+            refreshToken: { type: "string" },
+            refreshTokenExpiresAt: { type: "string" },
+            user: { type: "object", additionalProperties: true },
+          }),
+          ...openApiErrorResponses(400, 401, 429),
         },
       },
     },
@@ -203,16 +197,13 @@ export default async function authRoutes(app: FastifyInstance) {
           enforce: false,
         }),
         response: {
-          200: {
-            type: "object",
-            additionalProperties: true,
-            properties: {
-              token: { type: "string" },
-              refreshToken: { type: "string" },
-              refreshTokenExpiresAt: { type: "string" },
-              user: { type: "object", additionalProperties: true },
-            },
-          },
+          ...openApiResponse({
+            token: { type: "string" },
+            refreshToken: { type: "string" },
+            refreshTokenExpiresAt: { type: "string" },
+            user: { type: "object", additionalProperties: true },
+          }),
+          ...openApiErrorResponses(400, 401, 429),
         },
       },
     },
@@ -288,13 +279,8 @@ export default async function authRoutes(app: FastifyInstance) {
         description:
           "Revokes active refresh tokens associated with the authenticated session.",
         response: {
-          200: {
-            type: "object",
-            additionalProperties: true,
-            properties: {
-              ok: { type: "boolean" },
-            },
-          },
+          ...openApiOkResponse(),
+          ...openApiErrorResponses(401, 429),
         },
       },
     },
@@ -329,7 +315,10 @@ export default async function authRoutes(app: FastifyInstance) {
         tags: ["Auth"],
         summary: "Get current user profile",
         description: "Returns the profile of the currently authenticated user.",
-        response: openApiEnvelope("user"),
+        response: {
+          ...openApiEnvelope("user"),
+          ...openApiErrorResponses(401, 404),
+        },
       },
     },
     async (req) => {
@@ -355,7 +344,10 @@ export default async function authRoutes(app: FastifyInstance) {
           }),
           { enforce: false }
         ),
-        response: openApiEnvelope("user"),
+        response: {
+          ...openApiEnvelope("user"),
+          ...openApiErrorResponses(400, 401, 404),
+        },
       },
     },
     async (req) => {

@@ -287,7 +287,7 @@ describe("GET /settlements/:id/status — access", () => {
     });
 
     expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("MISSING_TOKEN");
     expect(prisma.settlement.findFirst).not.toHaveBeenCalled();
   });
 

@@ -6,7 +6,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
-import { groupMembership, requireGroupRole } from "../middleware";
+import { groupMembership, requireGroupAdmin, requireGroupMember } from "../middleware";
 import { stellar } from "../services/stellar";
 import { inviteCode } from "../services/codes";
 import { auditGroupMemberActionTx, auditTx, logActionTx } from "../services/audit";
@@ -216,7 +216,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.get(
     "/groups/:id/balance",
     {
-      preHandler: requireGroupRole("member", { param: "id" }),
+      preHandler: requireGroupMember({ param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Get a group's on-chain treasury balances",
@@ -288,7 +288,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.get(
     "/groups/:id",
     {
-      preHandler: requireGroupRole("member", { param: "id" }),
+      preHandler: requireGroupMember({ param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Get a group's detail and members",
@@ -374,7 +374,9 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.patch(
     "/groups/:id",
     {
-      preHandler: requireGroupRole("admin", { param: "id" }),
+      // Strict: settings may only be changed by an admin of a *live* group
+      // (archived groups are read-only, issue #648).
+      preHandler: requireGroupAdmin({ param: "id", active: true }),
       schema: {
         tags: ["Groups"],
         summary: "Update a group",
@@ -424,7 +426,9 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
     "/groups/:id/invite",
     {
       ...rateLimited("groupInvite"),
-      preHandler: requireGroupRole("admin", { param: "id" }),
+      // Strict: adding members to an archived group would reopen a closed
+      // group, so invitations require an admin of a live group.
+      preHandler: requireGroupAdmin({ param: "id", active: true }),
       schema: {
         tags: ["Groups"],
         summary: "Invite a user to a group",
@@ -623,7 +627,9 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.post(
     "/groups/:id/leave",
     {
-      preHandler: requireGroupRole("member", { param: "id" }),
+      // Leaving is deliberately allowed for members of an archived group:
+      // archival must not trap a user in a group they can no longer act in.
+      preHandler: requireGroupMember({ param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Leave a group",
@@ -677,7 +683,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.patch(
     "/groups/:id/members/:memberId",
     {
-      preHandler: requireGroupRole("admin", { param: "id" }),
+      preHandler: requireGroupAdmin({ param: "id", active: true }),
       schema: {
         tags: ["Groups"],
         summary: "Update a group member's role",
@@ -731,7 +737,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.delete(
     "/groups/:id/members/:memberId",
     {
-      preHandler: requireGroupRole("admin", { param: "id" }),
+      preHandler: requireGroupAdmin({ param: "id", active: true }),
       schema: {
         tags: ["Groups"],
         summary: "Remove a member from a group",
@@ -818,7 +824,7 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.post(
     "/groups/:id/members/role",
     {
-      preHandler: requireGroupRole("admin", { param: "id" }),
+      preHandler: requireGroupAdmin({ param: "id", active: true }),
       schema: {
         tags: ["Groups"],
         summary: "Change a member's role",
@@ -899,7 +905,9 @@ req.log.info({ userId: auth.id, groupId: created.id, action: "group.create" }, "
   app.post(
     "/groups/:id/archive",
     {
-      preHandler: requireGroupRole("admin", { param: "id" }),
+      // Archiving is the transition that *creates* the closed state, and it is
+      // idempotent, so this guard does not require an already-live group.
+      preHandler: requireGroupAdmin({ param: "id" }),
       schema: {
         tags: ["Groups"],
         summary: "Archive a group",

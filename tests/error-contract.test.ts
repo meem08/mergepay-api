@@ -155,26 +155,26 @@ describe("error response shape consistency", () => {
 });
 
 describe("authorization failures", () => {
-  it("UNAUTHORIZED when no auth header", async () => {
+  it("MISSING_TOKEN when no auth header", async () => {
     const res = await app.inject({ method: "GET", url: "/me" });
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.error.code).toBe("UNAUTHORIZED");
+    expect(body.error.code).toBe("MISSING_TOKEN");
   });
 
-  // #16: a credential that cannot be verified at all is INVALID_TOKEN, so a
-  // client does not confuse it with its own expired (but once-valid) token.
-  it("INVALID_TOKEN for malformed Bearer token", async () => {
+  // #16 / #925: a bearer value that is not a JWT at all is MALFORMED_TOKEN, so
+  // a client does not confuse it with its own expired (but once-valid) token.
+  it("MALFORMED_TOKEN for a Bearer value that is not a JWT", async () => {
     const res = await app.inject({ method: "GET", url: "/me", headers: { authorization: "Bearer bad-token" } });
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.error.code).toBe("INVALID_TOKEN");
+    expect(body.error.code).toBe("MALFORMED_TOKEN");
   });
 
-  it("UNAUTHORIZED when token is missing Bearer scheme", async () => {
+  it("MALFORMED_TOKEN when the header does not use the Bearer scheme", async () => {
     const res = await app.inject({ method: "GET", url: "/me", headers: { authorization: "Token xxx" } });
     expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("UNAUTHORIZED");
+    expect(res.json().error.code).toBe("MALFORMED_TOKEN");
   });
 });
 

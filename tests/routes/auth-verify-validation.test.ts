@@ -377,7 +377,7 @@ describe("POST /auth/verify — the SDK, not the schema, judges the envelope", (
     // The schema accepted it (it is valid base64 XDR), so the rejection is the
     // SDK's and keeps the opaque 401 that challenge verification always uses.
     expect(res.statusCode).toBe(401);
-    expect(res.json().code).toBe("UNAUTHORIZED");
+    expect(res.json().code).toBe("INVALID_CHALLENGE");
     expect(authenticateChallenge).toHaveBeenCalledWith(transaction);
     expect(h.prisma.user.upsert).not.toHaveBeenCalled();
     expect(h.prisma.auditLog.create).not.toHaveBeenCalled();

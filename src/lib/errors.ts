@@ -102,6 +102,48 @@ export const ErrorCode = {
   // 401
   UNAUTHORIZED: "UNAUTHORIZED",
   /**
+   * 401 — the SEP-10 challenge is not one this server will redeem: it does not
+   * decode, does not carry this server's signature, is structurally unlike what
+   * this server issues, or has already been redeemed. The catch-all for
+   * challenge failures; the codes below are only ever earned by an envelope
+   * this server demonstrably signed. See src/services/sep10.ts.
+   */
+  INVALID_CHALLENGE: "INVALID_CHALLENGE",
+  /**
+   * 401 — the challenge carries this server's signature, but over another
+   * Stellar network's passphrase. The client requested its challenge from a
+   * deployment on a different network (or mixed up passphrases while signing).
+   */
+  NETWORK_MISMATCH: "NETWORK_MISMATCH",
+  /**
+   * 400 on the request (`home_domain` names another domain) or 401 on a
+   * server-signed challenge whose `<home domain> auth` operation names a domain
+   * this server no longer authenticates for. The remedy is the same: request a
+   * fresh challenge for this server's home domain.
+   */
+  HOME_DOMAIN_MISMATCH: "HOME_DOMAIN_MISMATCH",
+  /**
+   * 401 on a SEP-10 challenge whose client signatures do not verify (missing,
+   * invalid, unrecognized, or below the account's medium threshold); 400 on a
+   * treasury envelope whose signature does not verify. The envelope itself is
+   * fine — the remedy is re-signing it with the right key(s).
+   */
+  INVALID_SIGNATURE: "INVALID_SIGNATURE",
+  /**
+   * 401 — a protected route was called with no `Authorization` header at all.
+   * Answered with `WWW-Authenticate: Bearer realm=...` and no error code, per
+   * RFC 6750 §3.1.
+   */
+  MISSING_TOKEN: "MISSING_TOKEN",
+  /**
+   * 401 — an `Authorization` header is present but is not `Bearer <token>`, or
+   * the token is not shaped like a JWT at all (not three base64url segments,
+   * or a header/payload that does not decode). Answered with
+   * `error="invalid_request"`. Distinct from INVALID_TOKEN: the client sent
+   * something other than a credential, rather than a credential that failed.
+   */
+  MALFORMED_TOKEN: "MALFORMED_TOKEN",
+  /**
    * 401 — a structurally valid session token whose `exp` has passed (or that
    * sits inside the expiry margin). Deliberately distinct from UNAUTHORIZED
    * and INVALID_TOKEN so a client knows the credential was once good and the
@@ -167,9 +209,10 @@ export {
   ConflictError,
   BadRequestError,
   InternalServerError,
+  BearerAuthError,
 } from "../errors/app-error";
 
-import { AppError } from "../errors/app-error";
+import { AppError, BearerAuthError } from "../errors/app-error";
 
 
 /** Factory helpers — mirrors the original `Errors` object in src/errors.ts. */
@@ -177,23 +220,49 @@ export const Errors = {
   unauthorized: (msg = "Authentication required") =>
     new AppError(401, ErrorCode.UNAUTHORIZED, msg),
 
+  /** No `Authorization` header on a protected route. See MISSING_TOKEN. */
+  missingToken: (
+    msg = "Authentication required. Send a bearer token in the Authorization header."
+  ) => new BearerAuthError(ErrorCode.MISSING_TOKEN, msg, null),
+
+  /** Not `Bearer <token>`, or a token not shaped like a JWT. See MALFORMED_TOKEN. */
+  malformedToken: (msg = "Authentication token is malformed") =>
+    new BearerAuthError(ErrorCode.MALFORMED_TOKEN, msg, "invalid_request"),
+
   /**
    * The session token's expiry has passed. Carries a `details.hint` naming
    * the re-authentication path — SEP-10 challenge/verify, or the refresh
    * endpoint for clients holding a refresh token — so a wallet integration
    * can react to the code without hard-coding the API's auth flow.
    */
-  tokenExpired: (msg = "Token expired", details?: unknown) =>
-    new AppError(401, ErrorCode.TOKEN_EXPIRED, msg, details),
+  tokenExpired: (msg = "Authentication token has expired", details?: unknown) =>
+    new BearerAuthError(ErrorCode.TOKEN_EXPIRED, msg, "invalid_token", details),
 
   /**
-   * The bearer token failed verification — malformed, wrong signature,
-   * disallowed algorithm, wrong issuer/audience, or a claims shape that does
-   * not identify an account. A refresh token cannot rescue a token like this;
-   * the client must re-authenticate via SEP-10.
+   * The bearer token failed verification — wrong signature, disallowed
+   * algorithm, wrong issuer/audience, not yet valid, or a claims shape that
+   * does not identify an account. A refresh token cannot rescue a token like
+   * this; the client must re-authenticate via SEP-10.
    */
-  invalidToken: (msg = "Invalid token", details?: unknown) =>
-    new AppError(401, ErrorCode.INVALID_TOKEN, msg, details),
+  invalidToken: (msg = "Authentication token is invalid", details?: unknown) =>
+    new BearerAuthError(ErrorCode.INVALID_TOKEN, msg, "invalid_token", details),
+
+  /** See INVALID_CHALLENGE. */
+  invalidChallenge: (
+    msg = "Authentication challenge is invalid. Request a new challenge and sign it without modification."
+  ) => new AppError(401, ErrorCode.INVALID_CHALLENGE, msg),
+
+  /** See NETWORK_MISMATCH. */
+  challengeNetworkMismatch: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.NETWORK_MISMATCH, msg, details),
+
+  /** See HOME_DOMAIN_MISMATCH. */
+  challengeHomeDomainMismatch: (msg: string, details?: unknown) =>
+    new AppError(401, ErrorCode.HOME_DOMAIN_MISMATCH, msg, details),
+
+  /** See INVALID_SIGNATURE. */
+  challengeSignatureInvalid: (msg: string) =>
+    new AppError(401, ErrorCode.INVALID_SIGNATURE, msg),
 
   /**
    * The SEP-10 challenge the wallet signed has passed its validity window.

@@ -105,7 +105,11 @@ function challenge(opts: ChallengeOptions): Transaction {
 }
 
 const xdrOf = (tx: Transaction) => tx.toXDR();
-const UNAUTHORIZED = { status: 401, code: "UNAUTHORIZED" };
+/**
+ * The opaque rejection: anything this server did not sign, or that is
+ * structurally unlike what it issues (#925 — previously the generic UNAUTHORIZED).
+ */
+const INVALID_CHALLENGE = { status: 401, code: "INVALID_CHALLENGE" };
 const SIGNATURE_MESSAGE = /signature verification failed/i;
 
 beforeEach(() => {
@@ -162,7 +166,6 @@ describe("structure and domains", () => {
   it.each<[string, () => ChallengeOptions]>([
     ["a non-zero sequence number", () => ({ client, sequence: "41" })],
     ["a source other than the server account", () => ({ client, source: other, signers: [Keypair.random(), other, client] })],
-    ["a mismatched home domain", () => ({ client, homeDomain: "evil.example.com" })],
     ["a mismatched web_auth_domain", () => ({ client, extraOps: [webAuthDomainOp("evil.example.com")] })],
     ["a missing web_auth_domain operation", () => ({ client, extraOps: [] })],
     ["a duplicated web_auth_domain operation", () => ({ client, extraOps: [webAuthDomainOp(), webAuthDomainOp()] })],
@@ -191,14 +194,28 @@ describe("structure and domains", () => {
       clientAccountId: new MuxedAccount(new Account(client.publicKey(), "0"), "42").accountId(),
     })],
     ["infinite timebounds (maxTime 0)", () => ({ client, timebounds: { minTime: 0, maxTime: 0 } })],
-  ])("rejects %s with the generic 401", async (_label, options) => {
-    await expect(verifyChallenge(xdrOf(challenge(options())))).rejects.toMatchObject(UNAUTHORIZED);
+  ])("rejects %s as INVALID_CHALLENGE", async (_label, options) => {
+    await expect(verifyChallenge(xdrOf(challenge(options())))).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 
-  it("rejects a challenge signed for the wrong network passphrase", async () => {
+  it("rejects this server's challenge for a mismatched home domain as HOME_DOMAIN_MISMATCH", async () => {
+    await expect(
+      verifyChallenge(xdrOf(challenge({ client, homeDomain: "evil.example.com" })))
+    ).rejects.toMatchObject({ status: 401, code: "HOME_DOMAIN_MISMATCH" });
+  });
+
+  it("rejects a forged challenge for a mismatched home domain as INVALID_CHALLENGE", async () => {
+    const tx = challenge({ client, homeDomain: "evil.example.com", signers: [other, client] });
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(INVALID_CHALLENGE);
+  });
+
+  it("rejects this server's challenge signed for the wrong network passphrase as NETWORK_MISMATCH", async () => {
     const wrong = config.networkPassphrase === Networks.TESTNET ? Networks.PUBLIC : Networks.TESTNET;
     const tx = challenge({ client, networkPassphrase: wrong });
-    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject({
+      status: 401,
+      code: "NETWORK_MISMATCH",
+    });
   });
 
   it("rejects a challenge with no timebounds at all", async () => {
@@ -210,7 +227,7 @@ describe("structure and domains", () => {
     unbounded.sign(serverKeypair());
     unbounded.sign(client);
 
-    await expect(verifyChallenge(unbounded.toXDR())).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(unbounded.toXDR())).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 
   it("rejects a fee-bump envelope wrapping an otherwise valid challenge", async () => {
@@ -223,11 +240,11 @@ describe("structure and domains", () => {
     );
     feeBump.sign(serverKeypair());
 
-    await expect(verifyChallenge(feeBump.toXDR())).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(feeBump.toXDR())).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 
   it.each(["not base64 at all!", "AAAA", ""])("rejects malformed XDR %j", async (bad) => {
-    await expect(verifyChallenge(bad)).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(bad)).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 });
 
@@ -242,7 +259,7 @@ describe("timebounds", () => {
     await expect(verifyChallenge(signed)).rejects.toMatchObject({ status: 401, code: "CHALLENGE_EXPIRED" });
   });
 
-  it("reports an expired envelope the server never signed as the generic 401, not CHALLENGE_EXPIRED", async () => {
+  it("reports an expired envelope the server never signed as INVALID_CHALLENGE, not CHALLENGE_EXPIRED", async () => {
     // Expired beyond the SDK's own 300s grace, so the SDK's expiry check fires
     // before it ever looks at the server signature.
     const client = Keypair.random();
@@ -250,20 +267,25 @@ describe("timebounds", () => {
     const signed = xdrOf(challenge({ client, signers: [forger, client] }));
     vi.setSystemTime(new Date(T0.getTime() + 700_000));
 
-    await expect(verifyChallenge(signed)).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(signed)).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 
-  it("reports a challenge that is not valid yet as the generic 401, not CHALLENGE_EXPIRED", async () => {
+  it("reports a challenge that is not valid yet as CHALLENGE_NOT_YET_VALID, not CHALLENGE_EXPIRED", async () => {
+    // Beyond the SDK's 300s grace: judged by this server's own skew tolerance
+    // before the SDK sees it, so the answer does not depend on which fired.
     const client = Keypair.random();
-    const start = nowS() + 600; // beyond the SDK's 300s grace
+    const start = nowS() + 600;
     const tx = challenge({ client, timebounds: { minTime: start, maxTime: start + 300 } });
 
-    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject({
+      status: 401,
+      code: "CHALLENGE_NOT_YET_VALID",
+    });
   });
 
   // Issue #709: a window that has not opened (or that outlives the validity
   // this server issues) gets its own 401 code instead of the generic
-  // UNAUTHORIZED, so clients can tell temporal mismatches from structural ones.
+  // INVALID_CHALLENGE, so clients can tell temporal mismatches from structural ones.
   it("rejects a challenge that starts beyond the 30s clock-skew tolerance as CHALLENGE_NOT_YET_VALID", async () => {
     const client = Keypair.random();
     const start = nowS() + 120; // inside the SDK's grace, outside ours
@@ -300,7 +322,7 @@ describe("signatures — unfunded account (master key)", () => {
   it("rejects a challenge missing the server signature", async () => {
     const client = Keypair.random();
     const tx = challenge({ client, signers: [client] });
-    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 
   it("rejects a challenge signed by a different key instead of the client", async () => {
@@ -324,7 +346,7 @@ describe("signatures — unfunded account (master key)", () => {
   it("fails closed when Horizon cannot be reached", async () => {
     h.loadAccount.mockRejectedValueOnce(new Error("horizon down"));
     const client = Keypair.random();
-    await expect(verifyChallenge(xdrOf(challenge({ client })))).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(xdrOf(challenge({ client })))).rejects.toMatchObject({ status: 502, code: "UPSTREAM_ERROR" });
   });
 });
 
@@ -402,7 +424,7 @@ describe("replay protection", () => {
     const signed = xdrOf(challenge({ client }));
 
     await expect(verifyChallenge(signed)).resolves.toBe(client.publicKey());
-    await expect(verifyChallenge(signed)).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(signed)).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 
   it("keeps the redemption record until the challenge can no longer be accepted", async () => {
@@ -420,7 +442,7 @@ describe("replay protection", () => {
     const other = Keypair.random();
     await expect(verifyChallenge(xdrOf(challenge({ client: other })))).resolves.toBe(other.publicKey());
 
-    await expect(verifyChallenge(signed)).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(signed)).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 
   it("does not burn a challenge that failed signature verification", async () => {

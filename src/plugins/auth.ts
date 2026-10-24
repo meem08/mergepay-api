@@ -23,31 +23,40 @@ declare module "fastify" {
   }
 }
 
+/**
+ * `Bearer <token68>` (RFC 6750 §2.1): the scheme, exactly one space, and one
+ * token with no further parts. The scheme is matched case-sensitively, as the
+ * rate limiter's identity key (src/plugins/rate-limit.ts) is — a spelling one
+ * accepted and the other did not would move an authenticated caller out of its
+ * per-user bucket.
+ */
 const authorizationHeaderSchema = z
   .string()
-  .regex(/^Bearer\s+\S+$/, "Authorization must use the Bearer scheme");
+  .regex(/^Bearer [A-Za-z0-9\-._~+/]+=*$/, "Authorization must be 'Bearer <token>'");
 
 /**
  * Authenticate a request from its `Authorization` header.
  *
- * Missing/undecodable credentials and a rejected token are reported with
- * different codes (UNAUTHORIZED vs TOKEN_EXPIRED/INVALID_TOKEN) so clients
- * can branch on the failure without parsing messages. The SDK's own error
- * text is never echoed back — only the stable codes and the re-auth hint.
+ * Each failure has its own stable code so clients can branch without parsing
+ * messages: MISSING_TOKEN (no header), MALFORMED_TOKEN (not `Bearer <token>`,
+ * or not a JWT), and from `verifyToken` TOKEN_EXPIRED / INVALID_TOKEN. All are
+ * 401s carrying an RFC 6750 `WWW-Authenticate` challenge (set by the error
+ * handler). The JWT library's own error text is never echoed back.
  */
 async function authenticate(req: FastifyRequest, _reply: FastifyReply) {
-  const parsedHeader = authorizationHeaderSchema.safeParse(req.headers.authorization);
-  if (!parsedHeader.success) {
-    // No usable Authorization header at all: not a token verdict, so this
-    // keeps the original generic code rather than INVALID_TOKEN.
-    throw Errors.unauthorized();
+  const header = req.headers.authorization;
+  if (header === undefined || header.trim() === "") {
+    throw Errors.missingToken();
   }
 
-  // verifyToken raises the specific 401 the caller should act on —
-  // TOKEN_EXPIRED with a re-authentication hint, INVALID_TOKEN for anything
-  // unverifiable — so those AppErrors must reach the error handler unmodified.
-  const token = parsedHeader.data.slice("Bearer ".length).trim();
-  req.user = verifyToken(token);
+  const parsedHeader = authorizationHeaderSchema.safeParse(header);
+  if (!parsedHeader.success) {
+    throw Errors.malformedToken("Authorization header must be of the form 'Bearer <token>'");
+  }
+
+  // verifyToken raises the specific 401 the caller should act on, so its
+  // AppErrors must reach the error handler unmodified.
+  req.user = verifyToken(parsedHeader.data.slice("Bearer ".length));
 }
 
 export default fp(async function authPlugin(app: FastifyInstance) {

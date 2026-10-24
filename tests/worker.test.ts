@@ -584,9 +584,76 @@ describe("processSubmittedSettlements", () => {
           failureReason: expect.any(String),
           errorCategory: "permanent", // Retries exhausted = permanent failure
           nextAttemptAt: null,
+          // Exhaustion is a dead letter, persisted rather than only logged.
+          deadLetteredAt: expect.any(Date),
         }),
       })
     );
+    expect(currentSettlementState?.deadLetteredAt).toBeInstanceOf(Date);
+  });
+
+  it("dead-letters a job whose retry budget was already spent before pickup", async () => {
+    // A crash can land between recording the final attempt and learning its
+    // outcome. The row is still "submitted" with retryCount === maxAttempts;
+    // the worker must pick it up and dead-letter it rather than leave a job
+    // that no future cycle will ever select.
+    setupSettlement({
+      status: "submitted",
+      retryCount: SETTLEMENT_MAX_RETRIES,
+      failureReason: "Horizon submit timed out",
+    });
+
+    await processSubmittedSettlements();
+
+    expect(h.submitPayment).not.toHaveBeenCalled();
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.errorCategory).toBe("permanent");
+    expect(currentSettlementState?.nextAttemptAt).toBeNull();
+    expect(currentSettlementState?.deadLetteredAt).toBeInstanceOf(Date);
+    // The last observed failure is preserved in the dead-letter reason.
+    expect(currentSettlementState?.failureReason).toContain("Retry budget exhausted");
+    expect(currentSettlementState?.failureReason).toContain("timed out");
+    expect(currentSettlementState?.failureCategory).toBe("upstream");
+  });
+
+  it("persists each transient retry before dead-lettering at the cap", async () => {
+    // End-to-end scheduling: every transient network failure records the
+    // attempt, its category, and the next eligible time, then the final attempt
+    // leaves a durable dead-letter marker.
+    setupSettlement({ status: "submitted" });
+    h.submitPayment.mockRejectedValue(new Error("Horizon connection reset"));
+    h.hashOf.mockReturnValue("hash_dead");
+    h.getTransaction.mockResolvedValue(null);
+
+    const delays: number[] = [];
+    setDelayFn((ms: number) => {
+      delays.push(ms);
+      return Promise.resolve();
+    });
+
+    await processSubmittedSettlements();
+
+    const retryUpdates = h.prisma.settlement.update.mock.calls
+      .map((call: any[]) => call[0].data)
+      .filter(
+        (data: any) =>
+          data?.retryCount !== undefined &&
+          data?.nextAttemptAt instanceof Date
+      );
+    expect(retryUpdates).toHaveLength(SETTLEMENT_MAX_RETRIES - 1);
+    for (const data of retryUpdates) {
+      expect(data.errorCategory).toBe("transient");
+      expect(data.nextAttemptAt.getTime()).toBeGreaterThan(Date.now() - 1000);
+    }
+    // Exponential backoff with jitter means each delay is positive and the
+    // second is larger than the first; the final attempt is not rescheduled.
+    expect(delays).toHaveLength(SETTLEMENT_MAX_RETRIES - 1);
+    expect(delays[0]).toBeGreaterThan(0);
+    expect(delays[1]).toBeGreaterThan(delays[0]);
+
+    expect(currentSettlementState?.status).toBe("failed");
+    expect(currentSettlementState?.deadLetteredAt).toBeInstanceOf(Date);
+    expect(currentSettlementState?.failureReason).toContain("retries exhausted");
   });
 
   it("marks as failed immediately on non-transient error without retrying", async () => {

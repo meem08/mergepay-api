@@ -216,7 +216,7 @@ describe("SEP-10 authentication integration", () => {
     const response = await verifyEnvelope(signedXdr);
 
     expect(response.statusCode).toBe(401);
-    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(response.json().code).toBe("INVALID_SIGNATURE");
     expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
   });
 
@@ -235,7 +235,7 @@ describe("SEP-10 authentication integration", () => {
     const response = await verifyEnvelope(signedXdr);
 
     expect(response.statusCode).toBe(401);
-    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(response.json().code).toBe("HOME_DOMAIN_MISMATCH");
     expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
   });
 
@@ -310,7 +310,7 @@ describe("SEP-10 authentication integration", () => {
     const response = await verifyEnvelope(signedXdr);
 
     expect(response.statusCode).toBe(401);
-    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(response.json().code).toBe("INVALID_SIGNATURE");
     expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
   });
 
@@ -343,7 +343,7 @@ describe("SEP-10 authentication integration", () => {
     );
   });
 
-  it("rejects a challenge with a tampered or invalid signature with UNAUTHORIZED", async () => {
+  it("rejects a challenge with a tampered or invalid signature with INVALID_SIGNATURE", async () => {
     const client = Keypair.random();
     const challenge = await requestChallenge(client.publicKey());
     const transaction = new Transaction(challenge.json().transaction, config.networkPassphrase);
@@ -354,7 +354,7 @@ describe("SEP-10 authentication integration", () => {
     const response = await verifyEnvelope(signedXdr);
 
     expect(response.statusCode).toBe(401);
-    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(response.json().code).toBe("INVALID_SIGNATURE");
     expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
   });
 
@@ -368,7 +368,7 @@ describe("SEP-10 authentication integration", () => {
 
     expect(first.statusCode).toBe(200);
     expect(replay.statusCode).toBe(401);
-    expect(replay.json().code).toBe("UNAUTHORIZED");
+    expect(replay.json().code).toBe("INVALID_CHALLENGE");
     expect(mocks.prisma.user.upsert).toHaveBeenCalledTimes(1);
   });
 });

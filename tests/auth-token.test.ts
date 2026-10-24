@@ -176,14 +176,14 @@ describe("verifyToken — claim and structure validation", () => {
     const truncated = token.split(".").slice(0, 2).join(".");
 
     expect(() => verifyToken(truncated)).toThrow(
-      expect.objectContaining({ code: "INVALID_TOKEN" })
+      expect.objectContaining({ code: "MALFORMED_TOKEN" })
     );
   });
 
   it("rejects a token that is not a JWT at all", () => {
     for (const garbage of ["", "not-a-token", "a.b.c", "....."]) {
       expect(() => verifyToken(garbage)).toThrow(
-        expect.objectContaining({ code: "INVALID_TOKEN" })
+        expect.objectContaining({ code: "MALFORMED_TOKEN" })
       );
     }
   });

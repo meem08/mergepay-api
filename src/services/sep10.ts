@@ -7,11 +7,13 @@
  * front of every protected group and settlement action. So verification is
  * deliberately strict and layered:
  *
- *  1. `WebAuth.readChallengeTx` parses the envelope against **our** network
- *     passphrase, server account, home domain, and web auth domain. A challenge
- *     built for another network, another anchor, or another domain fails here —
- *     the signature is computed over network-dependent bytes, so it cannot
- *     survive a passphrase swap.
+ *  1. `readChallenge` decodes the envelope, requires **our** server signature
+ *     over **our** network passphrase, checks the time bounds and home domain,
+ *     then hands it to `WebAuth.readChallengeTx` against our network, server
+ *     account, home domain, and web auth domain. A challenge built for another
+ *     network, another anchor, or another domain fails here — the signature is
+ *     computed over network-dependent bytes, so it cannot survive a passphrase
+ *     swap.
  *  2. `validateChallengeEnvelope` re-checks the structure this server actually
  *     issues: server-sourced, sequence 0, no memo, real time bounds (checked
  *     explicitly against server time with clock-skew tolerance — expired,
@@ -29,21 +31,27 @@
  *     is kept until the envelope's own `maxTime` plus the clock-skew
  *     tolerance, so it cannot be swept while the challenge is still usable.
  *
- * A rejected credential is always a 401, but never one uniform message: a
- * challenge that is otherwise well-formed and correctly signed but arrived
- * after its validity window is rejected with the dedicated CHALLENGE_EXPIRED
- * error so a client knows the envelope was good and the only remedy is to
- * request a fresh one; a window that has not yet opened or that outlives the
- * validity this server grants gets the sibling CHALLENGE_NOT_YET_VALID /
- * CHALLENGE_WINDOW_TOO_LONG codes. Signature and domain failures stay the
- * generic UNAUTHORIZED — distinguishing them from expiry would hand an attacker
- * a probe for which failures are structural rather than temporal. The one
- * exception is the challenge store itself: when it cannot be reached the
- * request fails closed with a 503 SERVICE_UNAVAILABLE (see
- * `challengeStoreUnavailable`), because an outage that reports itself as a wave
- * of bad credentials is unactionable for the operator and unrecoverable for the
- * client. The SDK's message, the challenge XDR, and any signature material are
- * never echoed back or logged either way.
+ * A rejected credential is always a 401 with a stable code. Anything this
+ * server did not demonstrably sign — undecodable, tampered with, built by
+ * someone else — is the opaque INVALID_CHALLENGE, so a forger learns nothing
+ * about which check failed. Only an envelope carrying this server's signature
+ * earns a precise answer: NETWORK_MISMATCH (signed for another network),
+ * CHALLENGE_EXPIRED / CHALLENGE_NOT_YET_VALID / CHALLENGE_WINDOW_TOO_LONG (its
+ * window), HOME_DOMAIN_MISMATCH (another home domain), or INVALID_SIGNATURE
+ * (client signatures that do not verify — the remedy is re-signing, not a new
+ * challenge). Structural failures, replays, and anything else stay
+ * INVALID_CHALLENGE. 401 rather than 400 is SEP-10-compliant: the spec's token
+ * endpoint treats every non-200 status as an error (SEP-10 v3.4.1, "Token" →
+ * "Response").
+ *
+ * The exceptions are this server's own dependencies, which fail closed but are
+ * not reported as bad credentials: an unreachable challenge store is a 503
+ * SERVICE_UNAVAILABLE (see `challengeStoreUnavailable`) and an unreachable
+ * Horizon a 502 UPSTREAM_ERROR (see `signerLookupUnavailable`), because an
+ * outage that reports itself as a wave of bad credentials is unactionable for
+ * the operator and unrecoverable for the client. The SDK's message, the
+ * challenge XDR, and any signature material are never echoed back or logged
+ * either way.
  *
  * Successful verification returns the client's public key; minting the session
  * token stays in src/routes/auth.ts, whose claims contract is unchanged.
@@ -54,6 +62,7 @@ import {
   Horizon,
   Keypair,
   MemoNone,
+  Networks,
   StrKey,
   Transaction,
   WebAuth,
@@ -84,9 +93,6 @@ import { stellar } from "./stellar";
 export const CHALLENGE_VALIDITY_SECONDS =
   config.SEP10_CHALLENGE_VALIDITY_SECONDS;
 
-/** The exact message the SDK raises when a challenge's own window has closed. */
-const EXPIRED_CHALLENGE_MESSAGE = "The transaction has expired";
-
 /** SEP-10 requires at least 32 bytes of server-chosen randomness in the nonce. */
 const MIN_NONCE_BYTES = 32;
 
@@ -110,7 +116,44 @@ export function serverKeypair(): Keypair {
 }
 
 function invalidChallenge(): never {
-  throw Errors.unauthorized("Invalid or expired authentication challenge");
+  throw Errors.invalidChallenge();
+}
+
+/**
+ * The envelope carries this server's signature, but over another network's
+ * passphrase. Only reachable for an envelope this server signed (see
+ * `readChallenge`), so it reveals nothing a forger could not already know —
+ * this server's network is public in its stellar.toml.
+ */
+function networkMismatch(): never {
+  throw Errors.challengeNetworkMismatch(
+    "Authentication challenge was issued for a different Stellar network. Request a new challenge from this server and sign it for its network.",
+    { networkPassphrase: config.networkPassphrase }
+  );
+}
+
+/**
+ * A challenge this server signed whose `<home domain> auth` operation names a
+ * domain it no longer authenticates for — e.g. one issued before
+ * SEP10_HOME_DOMAIN changed.
+ */
+function homeDomainMismatch(): never {
+  throw Errors.challengeHomeDomainMismatch(
+    "Authentication challenge was issued for a different home domain. Request a new challenge from this server.",
+    { homeDomain: config.SEP10_HOME_DOMAIN }
+  );
+}
+
+/**
+ * Horizon could not be asked for the client account's signers. The request
+ * fails closed — nobody is authenticated without that answer — but as the
+ * upstream outage it is (502, as every other Horizon failure in this API), not
+ * as a rejected credential: a client cannot fix an outage by re-signing.
+ */
+function signerLookupUnavailable(): never {
+  throw Errors.upstream(
+    "Unable to load the account's signers from the Stellar network. Please retry shortly."
+  );
 }
 
 /**
@@ -173,7 +216,7 @@ function invalidSignature(account?: string): never {
       metadata: { reason: "signature_verification_failed" },
     });
   }
-  throw Errors.unauthorized(
+  throw Errors.challengeSignatureInvalid(
     "Challenge signature verification failed. Ensure the challenge is signed by the account's signing key(s) before submitting."
   );
 }
@@ -391,10 +434,56 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): Ti
 }
 
 /**
+ * Every network passphrase the SDK knows other than this deployment's — the
+ * candidates `readChallenge` tries when deciding whether a rejected envelope
+ * is really this server's challenge for another network.
+ */
+const OTHER_NETWORK_PASSPHRASES = Object.values(Networks).filter(
+  (passphrase) => passphrase !== config.networkPassphrase
+);
+
+/** Whether this server's key signed the envelope over another network's passphrase. */
+function signedByServerOnAnotherNetwork(signedXdr: string, serverAccount: string): boolean {
+  return OTHER_NETWORK_PASSPHRASES.some((passphrase) => {
+    try {
+      return WebAuth.verifyTxSignedBy(new Transaction(signedXdr, passphrase), serverAccount);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** The client account the challenge's first operation names, when it is one. */
+function firstOperationAccount(tx: Transaction): string | undefined {
+  const source = (tx.operations as ChallengeOperation[])[0]?.source;
+  return source && isValidAccount(source) ? source : undefined;
+}
+
+/**
  * Parse a signed challenge against our own network, server account, and
- * domains. Every rejection the SDK can raise here — wrong passphrase, wrong
- * server key, wrong home or web auth domain, malformed XDR, missing server
- * signature — collapses to the same opaque 401.
+ * domains.
+ *
+ * The server signature is checked first, and it decides how much a rejection
+ * may say. An envelope this server did not sign — undecodable, a fee bump,
+ * tampered with after signing, built by someone else, sourced from another
+ * account — is answered with the opaque INVALID_CHALLENGE, whatever else is
+ * wrong with it, so a forger cannot probe which check failed. Only an envelope
+ * that demonstrably came from this server — and is shaped like a challenge,
+ * leading with a `<domain> auth` operation — earns a precise answer:
+ *
+ *  - signed for another network          → NETWORK_MISMATCH
+ *  - window closed / not open / too long → CHALLENGE_EXPIRED /
+ *                                          CHALLENGE_NOT_YET_VALID /
+ *                                          CHALLENGE_WINDOW_TOO_LONG
+ *  - another home domain                 → HOME_DOMAIN_MISMATCH
+ *  - anything else the SDK rejects       → INVALID_CHALLENGE
+ *
+ * The time bounds are judged here, against server time with this server's
+ * clock-skew tolerance, *before* the SDK sees the envelope: the SDK's own check
+ * grants five minutes of grace either side and reports both directions as
+ * "expired", so leaving it first would make the answer depend on which of the
+ * two tolerances a window happened to fall between. The SDK's message is never
+ * surfaced; it can name internal details such as the server account.
  */
 function readChallenge(
   signedXdr: string,
@@ -402,15 +491,40 @@ function readChallenge(
 ): { tx: Transaction; clientAccountID: string } {
   let tx: Transaction;
   try {
+    // Throws for undecodable XDR and for a fee-bump envelope, which SEP-10
+    // does not allow.
     tx = new Transaction(signedXdr, config.networkPassphrase);
-    const bounds = readTimeBounds(tx);
-    if (bounds && bounds.maxTime > 0 && bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= nowSeconds()) {
-      if (WebAuth.verifyTxSignedBy(tx, serverAccount)) {
-        expiredChallenge();
-      }
-    }
-  } catch (error) {
-    if (error instanceof AppError) throw error;
+  } catch {
+    invalidChallenge();
+  }
+
+  if (!WebAuth.verifyTxSignedBy(tx, serverAccount)) {
+    if (signedByServerOnAnotherNetwork(signedXdr, serverAccount)) networkMismatch();
+    invalidChallenge();
+  }
+
+  // Not challenge-shaped at all (no leading `<domain> auth` operation): there
+  // is no window or domain worth reporting on.
+  const homeDomain = extractHomeDomain(tx);
+  if (homeDomain === null) invalidChallenge();
+
+  // A window that has closed is reported as expiry even when it is otherwise
+  // malformed (e.g. inverted bounds): the remedy is the same fresh challenge,
+  // and this precedence is what verification has always given a server-signed
+  // envelope.
+  const bounds = readTimeBounds(tx);
+  const account = firstOperationAccount(tx);
+  if (
+    bounds &&
+    bounds.maxTime > 0 &&
+    bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= nowSeconds()
+  ) {
+    expiredChallenge(account);
+  }
+  validateChallengeTimeBounds(bounds, undefined, account);
+
+  if (homeDomain.toLowerCase() !== config.SEP10_HOME_DOMAIN.toLowerCase()) {
+    homeDomainMismatch();
   }
 
   try {
@@ -421,49 +535,9 @@ function readChallenge(
       config.SEP10_HOME_DOMAIN,
       config.WEB_AUTH_DOMAIN
     );
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message === EXPIRED_CHALLENGE_MESSAGE &&
-      isExpiredServerChallenge(signedXdr, serverAccount)
-    ) {
-      expiredChallenge();
-    }
-    try {
-      tx = new Transaction(signedXdr, config.networkPassphrase);
-      const bounds = readTimeBounds(tx);
-      if (bounds && bounds.maxTime > 0 && bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= nowSeconds()) {
-        expiredChallenge();
-      }
-    } catch {
-      // Fallthrough to invalidChallenge if parsing fails
-    }
-    // The SDK's message can name internal details; never surface it.
+  } catch {
     invalidChallenge();
   }
-}
-
-/**
- * Whether an envelope the SDK called "expired" really is an expired challenge
- * issued by this server.
- *
- * The SDK checks time bounds *before* the server signature, and it raises the
- * same "expired" message for a challenge that is not valid yet. Without this
- * check a forged, unsigned envelope with old time bounds would earn the
- * distinct CHALLENGE_EXPIRED answer — exactly the structural-vs-temporal probe
- * the uniform 401 exists to deny — and a not-yet-valid challenge would be
- * misreported as expired.
- */
-function isExpiredServerChallenge(signedXdr: string, serverAccount: string): boolean {
-  let tx: Transaction;
-  try {
-    tx = new Transaction(signedXdr, config.networkPassphrase);
-  } catch {
-    return false;
-  }
-  if (!WebAuth.verifyTxSignedBy(tx, serverAccount)) return false;
-  const bounds = readTimeBounds(tx);
-  return bounds !== null && bounds.maxTime > 0 && bounds.maxTime < nowSeconds();
 }
 
 /** Stable per-challenge identity used for single-use redemption. */
@@ -568,18 +642,13 @@ async function consumeChallenge(params: {
 /**
  * Verify a signed challenge and return the authenticated client public key.
  *
- * A rejected credential is a 401 — never one uniform message: a challenge that
- * is otherwise well-formed and correctly signed but arrived after its validity
- * window is rejected with CHALLENGE_EXPIRED, a window that has not yet opened or
- * that outlives the validity this server grants with CHALLENGE_NOT_YET_VALID /
- * CHALLENGE_WINDOW_TOO_LONG, and everything else (wrong signature, wrong
- * network, wrong home or web-auth domain, a structurally unlike envelope, an
- * already-redeemed challenge) with the generic UNAUTHORIZED. Signature failures
- * report a distinct message from expiry so a client with a correctly-built but
- * unsigned envelope retries the signature; every other failure stays uniform, so
- * rejections cannot be probed for which check failed. The only non-401 is the
- * durable store being unreachable, which fails closed as a 503 (see
- * `challengeStoreUnavailable`).
+ * A rejected credential is a 401 whose code is decided as described at the top
+ * of this module: INVALID_CHALLENGE for anything this server did not sign, and
+ * the precise NETWORK_MISMATCH, CHALLENGE_EXPIRED, CHALLENGE_NOT_YET_VALID,
+ * CHALLENGE_WINDOW_TOO_LONG, HOME_DOMAIN_MISMATCH, or INVALID_SIGNATURE codes
+ * only for an envelope that carries this server's signature. The only non-401s
+ * are this server's dependencies failing closed: a 503 for the challenge store
+ * and a 502 for Horizon.
  */
 export async function verifyChallenge(signedXdr: string): Promise<string> {
   return (await authenticateChallenge(signedXdr)).account;
@@ -626,10 +695,12 @@ export async function authenticateChallenge(signedXdr: string): Promise<Verified
 
   // An account Horizon does not know yet is authenticated against its master
   // key; a funded one against its configured signers and medium threshold.
-  // Horizon being unreachable is not a reason to authenticate anyone.
+  // Horizon being unreachable is not a reason to authenticate anyone — nor a
+  // reason to tell the client its credential is bad. (An unfunded account is
+  // not a failure: loadAccount answers it with `exists: false`.)
   const snapshot = await stellar
     .loadAccount(clientAccountId)
-    .catch(() => invalidChallenge());
+    .catch(() => signerLookupUnavailable());
 
   try {
     if (!snapshot.exists) {
