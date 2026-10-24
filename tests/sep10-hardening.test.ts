@@ -288,7 +288,9 @@ describe("SEP-10 verification", () => {
   it("does not leak SDK error details in the rejection", async () => {
     await expect(verifyChallenge("garbage")).rejects.toMatchObject({
       status: 401,
-      message: "Invalid or expired authentication challenge",
+      code: "INVALID_CHALLENGE",
+      message:
+        "Authentication challenge is invalid. Request a new challenge and sign it without modification.",
     });
   });
 });

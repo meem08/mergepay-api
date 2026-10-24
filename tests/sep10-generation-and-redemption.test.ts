@@ -59,7 +59,8 @@ import { AppError } from "../src/errors";
 import { CLOCK_SKEW_TOLERANCE_SECONDS } from "../src/lib/time-bounds";
 
 const T0 = new Date("2026-09-29T12:00:00.000Z");
-const UNAUTHORIZED = { status: 401, code: "UNAUTHORIZED" };
+/** A replay, or any challenge this server will not redeem (#925). */
+const INVALID_CHALLENGE = { status: 401, code: "INVALID_CHALLENGE" };
 /**
  * An unreachable challenge store is the server's failure, not a rejected
  * credential. Verification still fails closed; only the reporting changes.
@@ -276,7 +277,7 @@ describe("SEP-10 redemption through the durable Sep10Challenge row", () => {
 
     await expect(verifyChallenge(xdr)).resolves.toBe(client.publicKey());
     const reason = await verifyChallenge(xdr).catch((e: unknown) => e);
-    expect(reason).toMatchObject(UNAUTHORIZED);
+    expect(reason).toMatchObject(INVALID_CHALLENGE);
     if (!(reason instanceof AppError)) {
       throw new Error(`expected the replay to reject with an AppError, got ${String(reason)}`);
     }
@@ -305,7 +306,7 @@ describe("SEP-10 redemption through the durable Sep10Challenge row", () => {
     expect(lost).toHaveLength(1);
     // The insert is the concurrency control, so there is no read-then-write
     // gap for a second request to slip through.
-    expect(lost[0]).toMatchObject({ reason: UNAUTHORIZED });
+    expect(lost[0]).toMatchObject({ reason: INVALID_CHALLENGE });
   });
 
   it("never writes a redemption row for a challenge that failed verification", async () => {
@@ -316,7 +317,7 @@ describe("SEP-10 redemption through the durable Sep10Challenge row", () => {
 
     await expect(verifyChallenge(unsigned)).rejects.toMatchObject({
       status: 401,
-      code: "UNAUTHORIZED",
+      code: "INVALID_SIGNATURE",
     });
     expect(h.create).not.toHaveBeenCalled();
     // A failed attempt cannot burn someone else's pending challenge.
@@ -373,7 +374,7 @@ describe("SEP-10 redemption through the durable Sep10Challenge row", () => {
     // Under test the write falls through to the documented in-process store,
     // which holds the same single-use guarantee.
     await expect(verifyChallenge(xdr)).resolves.toBe(client.publicKey());
-    await expect(verifyChallenge(xdr)).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(xdr)).rejects.toMatchObject(INVALID_CHALLENGE);
   });
 });
 

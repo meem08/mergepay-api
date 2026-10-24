@@ -494,11 +494,11 @@ describe("API Contract Alignment & Integration Test Suite", () => {
 
       expect(res.statusCode).toBe(401);
       const body: ApiErrorResponse = res.json();
-      expect(body.code).toBe("UNAUTHORIZED");
+      expect(body.code).toBe("MISSING_TOKEN");
       expect(typeof body.message).toBe("string");
       expect(typeof body.requestId).toBe("string");
       expect(body.error).toBeDefined();
-      expect(body.error.code).toBe("UNAUTHORIZED");
+      expect(body.error.code).toBe("MISSING_TOKEN");
     });
 
     it("rejects bad pagination parameters with 400 and VALIDATION_ERROR envelope", async () => {

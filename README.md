@@ -418,8 +418,9 @@ with the same claim-based rules (see `src/worker/index.ts`):
   category, and the final reason are columns on the row (`retryCount`,
   `nextAttemptAt`, `errorCategory`, `failureReason`), never process memory.
   An exhausted job stops retrying and is marked `failed` with a sanitized
-  reason; retries and failures are also recorded in the audit log / status
-  history.
+  reason and a `deadLetteredAt` timestamp; a row left at the retry cap by a
+  process crash is picked up and dead-lettered rather than stranded. Retries
+  and failures are also recorded in the audit log / status history.
 
 Retry budgets are exponential with jitter and fully configurable via env vars
 (see `.env.example`):
@@ -454,11 +455,45 @@ bounded 30-second clock-skew tolerance. A challenge whose `maxTime` has elapsed
 is rejected with 401 `CHALLENGE_EXPIRED` (the remedy is to request and sign a
 fresh one); one whose `minTime` has not been reached returns
 `CHALLENGE_NOT_YET_VALID`, and a window longer than the 300s validity the
-server issues returns `CHALLENGE_WINDOW_TOO_LONG`. All other verification
-failures stay the generic 401 `UNAUTHORIZED`, so rejections cannot be probed
-for which structural check failed. Challenges are single-use (durable replay
-detection), and the worker's challenge cleanup purges replay records once
-their window closes, keeping them for 24h forensics before deletion.
+server issues returns `CHALLENGE_WINDOW_TOO_LONG`. Challenges are single-use
+(durable replay detection), and the worker's challenge cleanup purges replay
+records once their window closes, keeping them for 24h forensics before
+deletion.
+
+Every challenge rejection is a 401 with a stable `error.code`. **The server
+signature is checked first and decides how specific the answer may be:** an
+envelope this server did not sign (undecodable, tampered with, built by another
+key, missing the server signature) is always the opaque `INVALID_CHALLENGE`,
+so a forger cannot probe which check failed. Only a server-signed envelope earns
+a precise code:
+
+| Code | When |
+| --- | --- |
+| `INVALID_CHALLENGE` | Not signed by this server, malformed, wrong source or sequence, wrong `web_auth_domain`, unexpected operations, or already redeemed |
+| `NETWORK_MISMATCH` | Signed by this server for another network's passphrase |
+| `CHALLENGE_EXPIRED` / `CHALLENGE_NOT_YET_VALID` / `CHALLENGE_WINDOW_TOO_LONG` | Time bounds (see above) |
+| `HOME_DOMAIN_MISMATCH` | Issued for a home domain this server no longer serves (a `home_domain` *body field* that mismatches is a 400 with the same code) |
+| `INVALID_SIGNATURE` | Client signatures missing, invalid, unrecognized, or below the account's medium threshold |
+
+401 rather than 400 is SEP-10-compliant: the token endpoint treats every
+non-200 status as an error (SEP-10 v3.4.1, *Token → Response*). A Horizon outage
+while loading the account's signers is a 502 `UPSTREAM_ERROR`, and an
+unreachable challenge store a 503 `SERVICE_UNAVAILABLE` — both fail closed, but
+neither is reported as a bad credential.
+
+Protected routes take `Authorization: Bearer <jwt>` (scheme case-sensitive,
+exactly one space). The token must be HS256 (no other algorithm, never
+`alg: none`), carry this server's issuer and audience, an unexpired `exp`, an
+`nbf`/`iat` no further than 5 seconds in the future, and non-empty `sub` (the
+user id) and `pk` (the account) claims. Rejections are 401s carrying an RFC 6750
+`WWW-Authenticate` header:
+
+| Code | `WWW-Authenticate` | When |
+| --- | --- | --- |
+| `MISSING_TOKEN` | `Bearer realm="mergepay-api"` | No `Authorization` header |
+| `MALFORMED_TOKEN` | `… error="invalid_request"` | Not `Bearer <token>`, or the token is not a decodable JWT |
+| `INVALID_TOKEN` | `… error="invalid_token"` | Bad signature, wrong algorithm/issuer/audience, not yet valid, or bad claims |
+| `TOKEN_EXPIRED` | `… error="invalid_token"` | Expired (or inside the expiry margin); `details` carries a re-auth hint |
 
 ### Settlement
 1. `POST /expenses/:id/settle` (or `POST /groups/:id/settlements`) builds an

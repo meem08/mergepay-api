@@ -204,7 +204,7 @@ describe("auth routes", () => {
     });
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.code).toBe("INVALID_SIGNATURE");
     expect(body.message).toContain("Challenge signature verification failed");
     expect(body.requestId).toBeTruthy();
     expect(body.token).toBeUndefined();
@@ -257,8 +257,10 @@ describe("auth routes", () => {
     });
     expect(second.statusCode).toBe(401);
     const body = second.json();
-    expect(body.code).toBe("UNAUTHORIZED");
-    expect(body.message).toBe("Invalid or expired authentication challenge");
+    expect(body.code).toBe("INVALID_CHALLENGE");
+    expect(body.message).toBe(
+      "Authentication challenge is invalid. Request a new challenge and sign it without modification."
+    );
     expect(body.token).toBeUndefined();
 
     // No second session or user was minted.
@@ -290,7 +292,7 @@ describe("auth routes", () => {
     expect(rejected).toHaveLength(2);
     expect(ok[0].json().token).toBeTruthy();
     for (const r of rejected) {
-      expect(r.json().code).toBe("UNAUTHORIZED");
+      expect(r.json().code).toBe("INVALID_CHALLENGE");
       expect(r.json().token).toBeUndefined();
     }
     expect(prisma.user.upsert).toHaveBeenCalledTimes(1);
@@ -300,7 +302,8 @@ describe("auth routes", () => {
     const res = await app.inject({ method: "GET", url: "/me" });
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.code).toBe("UNAUTHORIZED");
+    expect(body.code).toBe("MISSING_TOKEN");
+    expect(res.headers["www-authenticate"]).toBe('Bearer realm="mergepay-api"');
     expect(body.requestId).toBeTruthy();
   });
 
@@ -621,6 +624,13 @@ describe("expense routes", () => {
       { userId: user.id },
       { userId: "user_2" },
     ]);
+    // Twice: the route's membership guard, then the handler's in-transaction
+    // re-check.
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId,
       userId: user.id,
@@ -687,6 +697,13 @@ describe("expense routes", () => {
       { userId: user.id },
       { userId: "user_2" },
     ]);
+    // Twice: the route's membership guard, then the handler's in-transaction
+    // re-check.
+    prisma.groupMember.findUnique.mockResolvedValueOnce({
+      groupId,
+      userId: user.id,
+      role: "member",
+    });
     prisma.groupMember.findUnique.mockResolvedValueOnce({
       groupId,
       userId: user.id,

@@ -159,6 +159,12 @@ model Settlement {
   expiresAt      DateTime? @map("expires_at")
   submittedAt    DateTime? @map("submitted_at")
   confirmedAt    DateTime? @map("confirmed_at")
+  // Set when the worker stops trying: either the failure is permanent or the
+  // bounded retry budget is exhausted. The row's status is also "failed", but
+  // this timestamp makes dead-lettered work queryable on its own, so operators
+  // can separate worker-exhausted jobs from failures recorded on the request
+  // path without parsing the free-text failure reason.
+  deadLetteredAt DateTime? @map("dead_lettered_at")
   memo           String?
   /// Client-provided idempotency key for the creation request. Stored on the
   /// settlement itself so a partial-unique index can enforce that the same
@@ -182,6 +188,7 @@ model Settlement {
   @@index([status, updatedAt]) // For worker reconciliation queries
   @@index([status, nextAttemptAt]) // For picking up eligible worker jobs
   @@index([leaseExpiresAt]) // For recovering leases from crashed workers
+  @@index([deadLetteredAt]) // For finding jobs the worker gave up on
   @@index([expiresAt])
   @@index([expenseShareId])
   @@unique([expenseShareId, idempotencyKey], name: "settlement_expense_share_idempotency")
@@ -509,6 +516,9 @@ model AuditLog {
   @@index([userId])
   @@index([groupId])
   @@index([entityType, entityId])
+  // Audit feeds filter by action type and read newest-first; this keeps a
+  // large trail's most common query from scanning the whole table.
+  @@index([action, createdAt])
   @@map("audit_logs")
 }
 

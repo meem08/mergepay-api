@@ -9,6 +9,11 @@
  *   - requireGroupMember / requireMembershipGuard: ensures the caller is at least a member (or admin).
  *   - requireGroupAdmin / requireAdminGuard: ensures the caller holds the admin role.
  *
+ * Both accept `active: true`, which additionally rejects an archived group
+ * (issue #648). Mutating group management routes set it; reads, leaving, and
+ * archiving itself deliberately do not, so an archived group's history stays
+ * readable and a member who no longer has an active role can still exit.
+ *
  * Authorization failures return:
  *   - 401 Unauthorized when unauthenticated
  *   - 403 Forbidden when caller is not a member or lacks admin privileges
@@ -32,6 +37,13 @@ export interface GroupGuardOptions {
   param?: GroupIdParam;
   /** Whether the parameter addresses an expense ID that owns the group */
   fromExpense?: boolean;
+  /**
+   * Require the group to be live (not archived). Set this on every route that
+   * changes group state: archival closes a group to new state while its
+   * history stays readable (issue #648). Read routes omit it, so members of an
+   * archived group keep access to what it recorded.
+   */
+  active?: boolean;
 }
 
 /**
@@ -42,7 +54,11 @@ export function requireGroupMember(
   options: GroupGuardOptions = {}
 ): preHandlerAsyncHookHandler {
   const param = options.param ?? "id";
-  return requireGroupRole("member", { param, fromExpense: options.fromExpense });
+  return requireGroupRole("member", {
+    param,
+    fromExpense: options.fromExpense,
+    active: options.active,
+  });
 }
 
 /**
@@ -53,7 +69,11 @@ export function requireGroupAdmin(
   options: GroupGuardOptions = {}
 ): preHandlerAsyncHookHandler {
   const param = options.param ?? "id";
-  return requireGroupRole("admin", { param, fromExpense: options.fromExpense });
+  return requireGroupRole("admin", {
+    param,
+    fromExpense: options.fromExpense,
+    active: options.active,
+  });
 }
 
 // Aliases for explicit guard naming

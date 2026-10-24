@@ -70,13 +70,15 @@ import {
   verifySettlementLimit,
 } from "../services/group-balances";
 import { balanceAssetKey, type Suggestion } from "../services/settlement";
-import { validateAsset, validateAmount } from "../services/assets";
-import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
 import {
-  intentExpiry,
-  intentValiditySchema,
-  secondsUntilExpiry,
-} from "../lib/time-bounds";
+  freeformSettlementPayloadSchema,
+  settleExpensePayloadSchema,
+  settlementConfirmPayloadSchema,
+  settlementExecutePayloadSchema,
+  settlementIntentSchema,
+  settlementShareSchema,
+} from "../validations/settlement";
+import { intentExpiry, secondsUntilExpiry } from "../lib/time-bounds";
 import {
   isTerminalSettlementStatus,
   resolveSettlementStatus,
@@ -112,19 +114,15 @@ const settlementIdParamSchema = z.object({
     .regex(/^[A-Za-z0-9_-]+$/, "Not a valid settlement identifier"),
 });
 
-/**
- * Execution takes the settlement id in the body rather than the path. The
- * idempotency reservation hashes the body, so putting every field that defines
- * the request there is what makes "same key, different request" detectable at
- * all — a path parameter would sit outside the hash.
+/*
+ * Request bodies are validated by the shared schemas in
+ * src/validations/settlement.ts (#644). Execution takes the settlement id in
+ * the body rather than the path: the idempotency reservation hashes the body,
+ * so putting every field that defines the request there is what makes "same
+ * key, different request" detectable at all — a path parameter would sit
+ * outside the hash. Those schemas are strict, bounded, and asset/amount-aware;
+ * this file does not re-declare them.
  */
-const executeBodySchema = z.object({
-  settlementId: z.string().min(1).max(64),
-  signedXdr: z.string().min(1),
-});
-
-/** Body of `POST /settlements/:id/confirm` — the wallet's signed envelope. */
-const confirmBodySchema = z.object({ signedXdr: z.string().min(1) });
 
 /** Request-body schemas used for OpenAPI documentation of the settlement
  * creation routes (both routes validate the payload with Zod in-handler; the
@@ -194,19 +192,9 @@ export default async function settlementRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id: expenseId } = idParamSchema.parse(req.params);
-    const body = z
-      .object({
-        assetCode: z.string().min(1).max(12).optional(),
-        assetIssuer: z.string().nullable().optional(),
-        // A client may ask for a *shorter* signing window than the default; the
-        // schema bounds the request and the server clock decides the deadline.
-        validitySeconds: intentValiditySchema.optional(),
-      })
-      .superRefine((val, ctx) => {
-        // assetCode omitted means "use the expense's own asset" — already validated at creation.
-        if (val.assetCode !== undefined) refineStellarAsset(ctx, val.assetCode, val.assetIssuer);
-      })
-      .parse(req.body ?? {});
+    // Strict, structured validation of the optional asset override and the
+    // signing window. assetCode omitted means "use the expense's own asset".
+    const body = settleExpensePayloadSchema.parse(req.body ?? {});
     const idempotencyKey = readIdempotencyKey(req.headers);
 
     const expense = await prisma.expense.findUnique({
@@ -232,6 +220,14 @@ export default async function settlementRoutes(app: FastifyInstance) {
     if (expense.payerUserId === auth.id) {
       throw Errors.badRequest("payer_share", "You are the payer of this expense");
     }
+
+    // The share being settled is the amount that will move on-chain. Validate
+    // it against the same stroop-exact rules as a request amount, so a corrupt
+    // row fails here instead of producing an unbuildable envelope later.
+    const share = settlementShareSchema.parse({
+      userId: auth.id,
+      amount: myShare.shareAmount.toString(),
+    });
 
     const assetCode = body.assetCode ?? expense.assetCode;
     const assetIssuer =
@@ -326,7 +322,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
           toPublicKey: expense.payer.stellarPublicKey,
           assetCode,
           assetIssuer,
-          amount: myShare.shareAmount.toString(),
+          amount: share.amount,
           memoCode: code,
           validitySeconds,
         });
@@ -362,16 +358,9 @@ export default async function settlementRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id: groupId } = idParamSchema.parse(req.params);
-    const body = z
-      .object({
-        toUserId: z.string(),
-        amount: stellarAmountSchema,
-        assetCode: z.string().min(1).max(12),
-        assetIssuer: z.string().nullable().optional(),
-        validitySeconds: intentValiditySchema.optional(),
-      })
-      .superRefine((val, ctx) => refineStellarAsset(ctx, val.assetCode, val.assetIssuer))
-      .parse(req.body);
+    // Recipient id, on-chain amount, asset, and signing window are all
+    // validated by the shared schema before any lookup or write.
+    const body = freeformSettlementPayloadSchema.parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
     if (body.toUserId === auth.id) {
@@ -470,7 +459,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         description:
           "Validates the wallet's signed XDR against the original intent and submits it for on-chain execution. `Idempotency-Key` is required. Only the settlement's payer may confirm it.",
         params: openApiIdParams(),
-        body: openApiBody(confirmBodySchema),
+        body: openApiBody(settlementConfirmPayloadSchema),
         response: {
           ...openApiEnvelope("settlement"),
           ...openApiErrorResponses(400, 401, 403, 404, 409, 429),
@@ -480,7 +469,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id } = idParamSchema.parse(req.params);
-    const body = confirmBodySchema.parse(req.body);
+    const body = settlementConfirmPayloadSchema.parse(req.body);
 
     // Required, not optional: this is the request that ends in a payment, and a
     // wallet or mobile client retrying after a timeout must never be able to
@@ -689,7 +678,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
         summary: "Execute a settlement (idempotent submission)",
         description:
           "Submits a signed envelope toward Horizon with idempotency enforced at the HTTP layer. `X-Idempotency-Key` is required. Responds 202 when this request accepted the submission and 200 when it was already in flight.",
-        body: openApiBody(executeBodySchema),
+        body: openApiBody(settlementExecutePayloadSchema),
         response: {
           ...openApiEnvelope("settlement"),
           202: {
@@ -705,7 +694,7 @@ export default async function settlementRoutes(app: FastifyInstance) {
     },
     async (req, reply) => {
       const auth = requireUser(req);
-      const body = executeBodySchema.parse(req.body);
+      const body = settlementExecutePayloadSchema.parse(req.body);
 
       const settlementRow = await prisma.settlement.findUnique({
         where: { id: body.settlementId },
@@ -1255,12 +1244,19 @@ async function buildSettlementXdr(params: {
   memoCode: string;
   validitySeconds: number;
 }): Promise<string> {
+  // Last gate before an unsigned transaction exists (#644): both public keys
+  // are validated as ed25519 StrKeys, the asset must be supported on this
+  // network, the amount must be representable in stroops, and the memo code and
+  // validity window must be in range. A malformed intent fails here — before
+  // the Horizon account load below and before any XDR is built.
+  const intent = settlementIntentSchema.parse(params);
+
   // One account load serves both the preflight and the sequence number the
   // envelope is built on, so the balance check and the transaction describe the
   // same observation of the account rather than two Horizon reads apart.
   let account;
   try {
-    account = await stellar.loadAccount(params.fromPublicKey);
+    account = await stellar.loadAccount(intent.fromPublicKey);
   } catch {
     throw Errors.upstream(
       "Could not reach the Stellar network to check your balance. Try again shortly."
@@ -1273,24 +1269,24 @@ async function buildSettlementXdr(params: {
   // worker's submission errors are still handled.
   assertPreflightResult(
     evaluatePreflight(account, {
-      sourcePublicKey: params.fromPublicKey,
-      assetCode: params.assetCode,
-      assetIssuer: params.assetIssuer,
-      amount: params.amount,
+      sourcePublicKey: intent.fromPublicKey,
+      assetCode: intent.assetCode,
+      assetIssuer: intent.assetIssuer ?? null,
+      amount: intent.amount,
     })
   );
 
   return stellar.buildPayment({
-    sourcePublicKey: params.fromPublicKey,
+    sourcePublicKey: intent.fromPublicKey,
     sourceSequence: account.sequence,
-    destination: params.toPublicKey,
-    asset: { code: params.assetCode, issuer: params.assetIssuer },
-    amount: params.amount,
-    memoCode: params.memoCode,
+    destination: intent.toPublicKey,
+    asset: { code: intent.assetCode, issuer: intent.assetIssuer ?? null },
+    amount: intent.amount,
+    memoCode: intent.memoCode,
     // The envelope's own maxTime and the persisted expiresAt describe the same
     // deadline, so a wallet cannot return something valid longer than the
     // intent it was issued for.
-    validitySeconds: params.validitySeconds,
+    validitySeconds: intent.validitySeconds,
   });
 }
 

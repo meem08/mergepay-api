@@ -154,6 +154,13 @@ export default async function expenseRoutes(app: FastifyInstance) {
     const memo = body.memo?.trim() || shortCode().slice(0, 8);
 
     const expense = await prisma.$transaction(async (tx) => {
+      // Re-verify the caller's membership inside the atomic unit. The
+      // preHandler guard authorised the request before this handler ran, so a
+      // concurrent removal or archival could have landed since; re-running the
+      // same check here (as the update and delete routes already do) means the
+      // check and the insert either both see the membership or neither runs.
+      await requireActiveMembership(groupId, auth.id, tx);
+
       const created = await tx.expense.create({
         data: {
           groupId,
@@ -184,7 +191,16 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
         action: AuditAction.EXPENSE_CREATE,
         resourceType: "expense",
         resourceId: created.id,
-        metadata: { amount: body.amount, assetCode: body.assetCode },
+        // payerUserId is client-supplied, so it is recorded as metadata; the
+        // actor is always the authenticated user.
+        metadata: {
+          amount: body.amount,
+          assetCode: body.assetCode,
+          assetIssuer: body.assetIssuer ?? null,
+          payerUserId,
+          splitType: body.splitType,
+          shareCount: computed.length,
+        },
       });
 
       return created;
@@ -309,9 +325,10 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
       await auditTx(tx, {
         userId: auth.id,
         groupId: expense.groupId,
-        action: "expense.update",
+        action: AuditAction.EXPENSE_UPDATE,
         entityType: "expense",
         entityId: id,
+        metadata: { fields: Object.keys(body) },
       });
 
       return result;
@@ -367,9 +384,10 @@ req.log.info({ userId: auth.id, groupId, expenseId: created.id, action: "expense
       await auditTx(tx, {
         userId: auth.id,
         groupId: found.groupId,
-        action: "expense.delete",
+        action: AuditAction.EXPENSE_DELETE,
         entityType: "expense",
         entityId: id,
+        metadata: { amount: String(found.amount), assetCode: found.assetCode },
       });
     });
     return { ok: true };

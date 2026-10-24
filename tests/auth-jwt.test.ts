@@ -204,13 +204,21 @@ describe("verifyToken — signature verification", () => {
     expectAppError(() => verifyToken(token), "INVALID_TOKEN");
   });
 
+  // #925: something that is not a JWT at all is MALFORMED_TOKEN — distinct
+  // from a JWT that fails verification.
   it.each([
     ["an empty string", ""],
     ["a non-JWT value", "not-a-jwt"],
     ["a truncated token", "a.b.c"],
-    ["a token with an empty signature", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0."],
   ])("rejects %s as malformed", (_label, token) => {
-    expectAppError(() => verifyToken(token), "INVALID_TOKEN");
+    expectAppError(() => verifyToken(token), "MALFORMED_TOKEN");
+  });
+
+  it("rejects a well-formed token with an empty signature as INVALID_TOKEN", () => {
+    expectAppError(
+      () => verifyToken("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1In0."),
+      "INVALID_TOKEN"
+    );
   });
 });
 
@@ -220,7 +228,7 @@ describe("verifyToken — expiration checking", () => {
       () => verifyToken(signWith({ expiresIn: -10 })),
       "TOKEN_EXPIRED"
     );
-    expect(err.message).toBe("Token expired");
+    expect(err.message).toBe("Authentication token has expired");
   });
 
   it("classifies a token inside the expiry margin as TOKEN_EXPIRED", () => {
@@ -228,7 +236,7 @@ describe("verifyToken — expiration checking", () => {
       () => verifyToken(signWith({ expiresIn: Math.max(1, MARGIN - 5) })),
       "TOKEN_EXPIRED"
     );
-    expect(err.message).toBe("Token expired");
+    expect(err.message).toBe("Authentication token has expired");
   });
 
   it("accepts a token whose remaining lifetime is outside the margin", () => {

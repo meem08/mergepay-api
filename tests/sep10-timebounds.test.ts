@@ -213,11 +213,11 @@ describe("validateChallengeTimeBounds (unit)", () => {
 
   it("rejects missing or unbounded windows", () => {
     expect(() => validateChallengeTimeBounds(null, NOW)).toThrow(
-      expect.objectContaining({ code: "UNAUTHORIZED" })
+      expect.objectContaining({ code: "INVALID_CHALLENGE" })
     );
     expect(() =>
       validateChallengeTimeBounds({ minTime: 0, maxTime: 0 }, NOW)
-    ).toThrow(expect.objectContaining({ code: "UNAUTHORIZED" }));
+    ).toThrow(expect.objectContaining({ code: "INVALID_CHALLENGE" }));
   });  it("grants the clock-skew tolerance past maxTime", () => {
     expect(() =>
       validateChallengeTimeBounds(
@@ -418,7 +418,7 @@ describe("POST /auth/verify time-bound error responses (#709)", () => {
     expect(body.code ?? body.error?.code).toBe("CHALLENGE_WINDOW_TOO_LONG");
   });
 
-  it("keeps a signature failure on the generic UNAUTHORIZED while windows get their own codes", async () => {
+  it("keeps an envelope this server did not sign on the opaque INVALID_CHALLENGE while windows get their own codes", async () => {
     // A challenge with an over-long window AND an invalid signature: the
     // structural failure must win the response, never a temporal code.
     const client = Keypair.random();
@@ -456,7 +456,7 @@ describe("POST /auth/verify time-bound error responses (#709)", () => {
 
     expect(res.statusCode).toBe(401);
     const body = res.json();
-    expect(body.code ?? body.error?.code).toBe("UNAUTHORIZED");
+    expect(body.code ?? body.error?.code).toBe("INVALID_CHALLENGE");
   });
 
   it("builds challenges with a window that passes its own validation now", async () => {

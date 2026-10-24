@@ -317,7 +317,7 @@ describe("creating an intent records a server-controlled expiry", () => {
     expect(h.loadAccount).not.toHaveBeenCalled();
   });
 
-  it("ignores a client-supplied absolute deadline entirely", async () => {
+  it("rejects a client-supplied absolute deadline instead of honouring it", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/groups/group_1/settlements",
@@ -326,16 +326,17 @@ describe("creating an intent records a server-controlled expiry", () => {
         toUserId: "user_2",
         amount: "10",
         assetCode: "XLM",
-        // Not part of the schema — a client cannot set the deadline directly.
+        // Not part of the schema (#644): request bodies are strict, so an
+        // unknown key is a validation error rather than being silently
+        // stripped while the client believes its deadline was applied.
         expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
       },
     });
 
-    expect(res.statusCode).toBe(200);
-    const created = prisma.settlement.create.mock.calls[0][0].data;
-    expect(created.expiresAt.getTime()).toBeLessThanOrEqual(
-      Date.now() + INTENT_VALIDITY_SECONDS * 1000
-    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe("VALIDATION_ERROR");
+    expect(prisma.settlement.create).not.toHaveBeenCalled();
+    expect(h.buildPayment).not.toHaveBeenCalled();
   });
 
   it("records an expiry on treasury intents too", async () => {

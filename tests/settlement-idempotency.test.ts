@@ -88,15 +88,23 @@ vi.mock("../src/services/settlement-xdr", () => ({
   })),
 }));
 
+import { Keypair } from "@stellar/stellar-sdk";
 import { buildApp } from "../src/app";
 import { signToken } from "../src/plugins/auth";
 
 const prisma = h.prisma;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+//
+// Real ed25519 keys: the settlement intent is validated with the SDK's StrKey
+// rules before an XDR is built (#644), so a placeholder string would be
+// rejected as a malformed public key.
+const PAYER_PUBLIC_KEY = Keypair.random().publicKey();
+const SHARER_PUBLIC_KEY = Keypair.random().publicKey();
+
 const payer = () => ({
   id: "payer_1",
-  stellarPublicKey: "GPAYERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarPublicKey: PAYER_PUBLIC_KEY,
   displayName: "Payer",
   avatarUrl: null,
   createdAt: new Date("2026-01-01T00:00:00.000Z"),
@@ -104,7 +112,7 @@ const payer = () => ({
 
 const sharer = () => ({
   id: "user_1",
-  stellarPublicKey: "GSHAREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarPublicKey: SHARER_PUBLIC_KEY,
   displayName: "Sharer",
   avatarUrl: null,
   createdAt: new Date("2026-01-01T00:00:00.000Z"),

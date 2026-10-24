@@ -1,4 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import {
+  Account,
+  BASE_FEE,
+  Keypair,
+  Operation,
+  TransactionBuilder,
+} from "@stellar/stellar-sdk";
 
 const h = vi.hoisted(() => {
   const prisma: any = {
@@ -65,6 +72,26 @@ function authHeader() {
     stellarPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
   });
   return { authorization: `Bearer ${token}` };
+}
+
+/**
+ * A canonical signed transaction envelope, as the completion route now accepts
+ * (it shares the strict signed-XDR contract with the other transaction
+ * surfaces). The previous `"AAAA..."` placeholder is not base64 XDR.
+ */
+function signedXdr(): string {
+  const signer = Keypair.random();
+  const transaction = new TransactionBuilder(new Account(signer.publicKey(), "0"), {
+    fee: BASE_FEE,
+    networkPassphrase: config.networkPassphrase,
+  })
+    .addOperation(
+      Operation.manageData({ name: "sep24-complete-test", value: "signed" })
+    )
+    .setTimeout(60)
+    .build();
+  transaction.sign(signer);
+  return transaction.toXDR();
 }
 
 let app: Awaited<ReturnType<typeof buildApp>>;
@@ -235,7 +262,7 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
       method: "POST",
       url: "/anchors/sessions/session_1/complete",
       headers: authHeader(),
-      payload: { signedXdr: "AAAA..." },
+      payload: { signedXdr: signedXdr() },
     });
 
     expect(res.statusCode).toBe(200);
@@ -280,7 +307,7 @@ describe("POST /anchors/sessions/:id/complete — transition + audit", () => {
       method: "POST",
       url: "/anchors/sessions/session_1/complete",
       headers: authHeader(),
-      payload: { signedXdr: "AAAA..." },
+      payload: { signedXdr: signedXdr() },
     });
 
     expect(res.statusCode).toBe(404);

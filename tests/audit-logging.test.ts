@@ -199,6 +199,16 @@ describe("AC6: audit logging consistency", () => {
             action: "expense.create",
             entityType: "expense",
             entityId: "exp_1",
+            // Split details are recorded so the entry explains the expense;
+            // the payer is metadata, never the actor.
+            metadata: expect.objectContaining({
+              amount: "50",
+              assetCode: "XLM",
+              assetIssuer: null,
+              payerUserId: userA.id,
+              splitType: "equal",
+              shareCount: 1,
+            }),
           }),
         })
       );

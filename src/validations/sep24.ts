@@ -26,6 +26,10 @@ import {
   stellarPublicKeySchema,
 } from "../lib/stellar-validation";
 import { paginationQuerySchema } from "../lib/pagination";
+import { signedXdrRequestSchema } from "./stellar-transaction";
+
+/** Language tag accepted by SEP-24 start, read, and callback endpoints. */
+export const sep24LangSchema = z.string().min(2).max(10);
 
 // ─── Callback query-parameter schema ─────────────────────────────────────────
 
@@ -39,7 +43,7 @@ import { paginationQuerySchema } from "../lib/pagination";
  */
 export const sep24CallbackQuerySchema = z
   .object({
-    lang: z.string().min(2).max(10).optional(),
+    lang: sep24LangSchema.optional(),
   })
   .strict();
 
@@ -60,9 +64,24 @@ export const sep24CallbackQuerySchema = z
  */
 export const sep24InitQuerySchema = z
   .object({
-    lang: z.string().min(2).max(10).optional(),
+    lang: sep24LangSchema.optional(),
   })
   .strict();
+
+/**
+ * An opaque identifier for a SEP-24 transaction or anchor session.
+ *
+ * Anchors mint ids of their own choosing — the reference SRT anchor uses
+ * composite `account:nonce` forms — so the alphabet has to admit `:` and `.`.
+ * What it must not admit is whitespace, `/`, `?` or `&`, which would mean the
+ * caller is describing something other than one opaque id. The bound keeps a
+ * path/query value from being used as an unbounded lookup key.
+ */
+export const sep24OpaqueIdSchema = z
+  .string()
+  .min(1, "id is required")
+  .max(120, "id is too long")
+  .regex(/^[A-Za-z0-9_:.-]+$/, "id must be an opaque transaction identifier");
 
 /**
  * Query parameters for SEP-24 transaction status polling
@@ -81,16 +100,8 @@ export const sep24InitQuerySchema = z
  */
 export const sep24TransactionQuerySchema = z
   .object({
-    id: z
-      .string()
-      .min(1, "id is required")
-      .max(120, "id is too long")
-      // Anchors mint ids of their own choosing — the reference SRT anchor uses
-      // composite `account:nonce` forms — so the alphabet has to admit `:` and
-      // `.`. What it must not admit is whitespace, `/`, `?` or `&`, which would
-      // mean the caller is describing something other than one opaque id.
-      .regex(/^[A-Za-z0-9_:.-]+$/, "id must be an opaque transaction identifier"),
-    lang: z.string().min(2).max(10).optional(),
+    id: sep24OpaqueIdSchema,
+    lang: sep24LangSchema.optional(),
   })
   .strict();
 
@@ -117,10 +128,50 @@ export type Sep24TransactionQuery = z.infer<typeof sep24TransactionQuerySchema>;
  */
 export const sep24TransactionsQuerySchema = paginationQuerySchema.extend({
   kind: z.enum(["deposit", "withdrawal"]).optional(),
-  lang: z.string().min(2).max(10).optional(),
+  lang: sep24LangSchema.optional(),
 });
 
 export type Sep24TransactionsQuery = z.infer<typeof sep24TransactionsQuerySchema>;
+
+/**
+ * Path parameter for the anchor-session status read and interactive completion
+ * routes (`GET /anchors/sessions/:id`, `POST /anchors/sessions/:id/complete`).
+ *
+ * Same opaque-id rule as the SEP-24 status poll, written once so the two
+ * status-reading surfaces cannot drift apart.
+ */
+export const sep24SessionParamsSchema = z
+  .object({ id: sep24OpaqueIdSchema })
+  .strict();
+
+/**
+ * Query parameters for reading or completing one anchor session.
+ *
+ * These routes take no query parameters that affect the response, so the schema
+ * is strict: an unknown key is a client bug (or an injection attempt) and is
+ * rejected before the session row is read. `lang` is tolerated for parity with
+ * the other SEP-24 endpoints, matching their localisation contract.
+ */
+export const sep24SessionQuerySchema = z
+  .object({ lang: sep24LangSchema.optional() })
+  .strict();
+
+/**
+ * Body of `POST /anchors/sessions/:id/complete` — the signed SEP-10 challenge
+ * that the anchor exchanges for a token.
+ *
+ * Reuses the shared signed-XDR contract (`src/validations/stellar-transaction.ts`)
+ * rather than a bare `min(1)` string: the value is base64 forwarded verbatim to
+ * the anchor's `/challenge` endpoint, so validating that it is canonical base64
+ * that the SDK can decode turns a malformed payload into a 400 at the boundary
+ * instead of an opaque upstream failure. Strict, like the initiation bodies, so
+ * an unknown field is named rather than silently dropped.
+ */
+export const sep24CompleteRequestSchema = signedXdrRequestSchema.strict();
+
+export type Sep24SessionParams = z.infer<typeof sep24SessionParamsSchema>;
+export type Sep24SessionQuery = z.infer<typeof sep24SessionQuerySchema>;
+export type Sep24CompleteRequest = z.infer<typeof sep24CompleteRequestSchema>;
 
 /** A Stellar transaction hash is a 32-byte value encoded as 64 hex chars. */
 export const sep24StellarTransactionHashSchema = z

@@ -42,9 +42,16 @@ Every error — validation, authorization, rate limiting, upstream — uses one 
 | `MISSING_IDEMPOTENCY_KEY` | 400 | The route requires an `Idempotency-Key` header and none was sent |
 | `IDEMPOTENCY_CONFLICT` | 409 | The key was already used with a different payload |
 | `IDEMPOTENCY_IN_PROGRESS` | 409 | The first request with this key is still running; retry shortly |
-| `UNAUTHORIZED` | 401 | Missing or invalid session |
-| `TOKEN_EXPIRED` | 401 | The session JWT's `exp` claim has passed — re-authenticate via SEP-10 or `POST /auth/refresh`; `details` carries a re-auth hint |
-| `INVALID_TOKEN` | 401 | The bearer token was rejected (malformed, wrong signature, wrong algorithm/issuer/audience) — re-authenticate via SEP-10; refresh cannot redeem it |
+| `UNAUTHORIZED` | 401 | Invalid refresh token, or a route reached without an authenticated user |
+| `MISSING_TOKEN` | 401 | A protected route was called with no `Authorization` header (`WWW-Authenticate: Bearer realm="mergepay-api"`) |
+| `MALFORMED_TOKEN` | 401 | The `Authorization` header is not `Bearer <token>`, or the token is not a decodable JWT (`error="invalid_request"`) |
+| `TOKEN_EXPIRED` | 401 | The session JWT's `exp` claim has passed — re-authenticate via SEP-10 or `POST /auth/refresh`; `details` carries a re-auth hint (`error="invalid_token"`) |
+| `INVALID_TOKEN` | 401 | The bearer token was rejected (wrong signature, wrong algorithm/issuer/audience, not yet valid, bad claims) — re-authenticate via SEP-10; refresh cannot redeem it (`error="invalid_token"`) |
+| `INVALID_CHALLENGE` | 401 | `POST /auth/verify`: the SEP-10 challenge is not one this server will redeem — request a new one |
+| `NETWORK_MISMATCH` | 401 | `POST /auth/verify`: this server's challenge, signed for another Stellar network |
+| `CHALLENGE_EXPIRED` / `CHALLENGE_NOT_YET_VALID` / `CHALLENGE_WINDOW_TOO_LONG` | 401 | `POST /auth/verify`: the challenge's time bounds are not presently redeemable |
+| `HOME_DOMAIN_MISMATCH` | 400 / 401 | `POST /auth/verify`: the `home_domain` field (400) or the challenge itself (401) names another home domain |
+| `INVALID_SIGNATURE` | 401 | `POST /auth/verify`: the challenge's client signatures do not verify — re-sign it |
 | `FORBIDDEN` | 403 | Authenticated, but not permitted on this resource |
 | `NOT_FOUND` | 404 | The resource does not exist |
 | `RATE_LIMITED` | 429 | Per-route budget exhausted; the wait is in the `Retry-After` header |

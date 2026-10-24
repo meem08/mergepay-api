@@ -9,10 +9,13 @@
  * from signature and domain failures:
  *
  *  - Expired challenge  → 401 CHALLENGE_EXPIRED, message names the remedy.
- *  - Signature failure  → 401 UNAUTHORIZED with a message that points at the
- *                         signature, distinct from expiry.
- *  - Home-domain and other structural failures → generic 401 UNAUTHORIZED,
- *    deliberately opaque so rejections cannot be probed for which check fired.
+ *  - Signature failure  → 401 INVALID_SIGNATURE with a message that points at
+ *                         the signature, distinct from expiry.
+ *  - Home domain        → 401 HOME_DOMAIN_MISMATCH, but only for a challenge
+ *                         this server signed (#925).
+ *  - Anything not signed by this server, and other structural failures →
+ *    401 INVALID_CHALLENGE, deliberately opaque so rejections cannot be probed
+ *    for which check fired.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
@@ -175,13 +178,13 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(
         verifyChallenge(signAndEncode(client, transaction))
-      ).rejects.toMatchObject({ status: 401, code: "UNAUTHORIZED" });
+      ).rejects.toMatchObject({ status: 401, code: "HOME_DOMAIN_MISMATCH" });
     });
 
-    it("does not leak the home-domain mismatch in the error message", async () => {
+    it("does not leak the home-domain mismatch for a challenge this server did not sign", async () => {
       const client = Keypair.random();
       const transaction = WebAuth.buildChallengeTx(
-        serverKeypair(),
+        Keypair.random(),
         client.publicKey(),
         "wrong-domain.example.com",
         CHALLENGE_VALIDITY_SECONDS,
@@ -192,7 +195,8 @@ describe("SEP-10 challenge validation (#540)", () => {
       await expect(
         verifyChallenge(signAndEncode(client, transaction))
       ).rejects.toMatchObject({
-        message: "Invalid or expired authentication challenge",
+        code: "INVALID_CHALLENGE",
+        message: expect.not.stringMatching(/home domain/i),
       });
     });
 
@@ -209,10 +213,10 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(
         verifyChallenge(signAndEncode(client, transaction))
-      ).rejects.toMatchObject({ status: 401, code: "UNAUTHORIZED" });
+      ).rejects.toMatchObject({ status: 401, code: "INVALID_CHALLENGE" });
     });
 
-    it("rejects a challenge built on the wrong network passphrase", async () => {
+    it("rejects this server's challenge built on the wrong network passphrase as NETWORK_MISMATCH", async () => {
       const client = Keypair.random();
       const wrongNetwork =
         config.networkPassphrase === Networks.TESTNET
@@ -229,7 +233,7 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(
         verifyChallenge(signAndEncode(client, transaction))
-      ).rejects.toMatchObject({ status: 401, code: "UNAUTHORIZED" });
+      ).rejects.toMatchObject({ status: 401, code: "NETWORK_MISMATCH" });
     });
 
     it("rejects a challenge naming the configured domain but with an empty nonce", async () => {
@@ -262,7 +266,7 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(verifyChallenge(tx.toXDR())).rejects.toMatchObject({
         status: 401,
-        code: "UNAUTHORIZED",
+        code: "INVALID_CHALLENGE",
       });
     });
   });
@@ -277,7 +281,7 @@ describe("SEP-10 challenge validation (#540)", () => {
         verifyChallenge(signAndEncode(impostor, transaction))
       ).rejects.toMatchObject({
         status: 401,
-        code: "UNAUTHORIZED",
+        code: "INVALID_SIGNATURE",
         message:
           "Challenge signature verification failed. Ensure the challenge is signed by the account's signing key(s) before submitting.",
       });
@@ -290,7 +294,7 @@ describe("SEP-10 challenge validation (#540)", () => {
       // Server-signed only — the envelope is otherwise exactly what we issued.
       await expect(verifyChallenge(transaction)).rejects.toMatchObject({
         status: 401,
-        code: "UNAUTHORIZED",
+        code: "INVALID_SIGNATURE",
         message:
           "Challenge signature verification failed. Ensure the challenge is signed by the account's signing key(s) before submitting.",
       });
@@ -303,7 +307,7 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(
         verifyChallenge(signAndEncode(impostor, transaction))
-      ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      ).rejects.toMatchObject({ code: "INVALID_SIGNATURE" });
       await expect(
         verifyChallenge(signAndEncode(impostor, transaction))
       ).rejects.not.toMatchObject({ code: "CHALLENGE_EXPIRED" });
@@ -323,7 +327,7 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(
         verifyChallenge(signAndEncode(client, transaction))
-      ).rejects.toMatchObject({ status: 401, code: "UNAUTHORIZED" });
+      ).rejects.toMatchObject({ status: 401, code: "INVALID_CHALLENGE" });
     });
   });
 
@@ -331,8 +335,9 @@ describe("SEP-10 challenge validation (#540)", () => {
     it("rejects a malformed challenge string", async () => {
       await expect(verifyChallenge("not-a-real-xdr")).rejects.toMatchObject({
         status: 401,
-        code: "UNAUTHORIZED",
-        message: "Invalid or expired authentication challenge",
+        code: "INVALID_CHALLENGE",
+        message:
+          "Authentication challenge is invalid. Request a new challenge and sign it without modification.",
       });
     });
 
@@ -356,7 +361,7 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(verifyChallenge(tx.toXDR())).rejects.toMatchObject({
         status: 401,
-        code: "UNAUTHORIZED",
+        code: "INVALID_CHALLENGE",
       });
     });
 
@@ -389,7 +394,7 @@ describe("SEP-10 challenge validation (#540)", () => {
 
       await expect(verifyChallenge(tx.toXDR())).rejects.toMatchObject({
         status: 401,
-        code: "UNAUTHORIZED",
+        code: "CHALLENGE_NOT_YET_VALID",
       });
     });
 

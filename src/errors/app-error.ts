@@ -63,6 +63,46 @@ export class UnauthorizedError extends AppError {
   }
 }
 
+/** Realm named in every bearer challenge this API issues. */
+export const BEARER_REALM = "mergepay-api";
+
+/** RFC 6750 §3.1 error codes this API reports in a bearer challenge. */
+export type BearerErrorCode = "invalid_request" | "invalid_token";
+
+/**
+ * 401 for a protected route's bearer credential — missing, malformed, invalid,
+ * or expired.
+ *
+ * Carries the `WWW-Authenticate` challenge RFC 6750 §3 requires on such a 401;
+ * the central error handler sends it. `bearerError` is `null` when the request
+ * carried no credential at all, because RFC 6750 §3.1 says the challenge then
+ * SHOULD NOT include an error code. The `error_description` is the error's own
+ * fixed, client-safe message — never library text.
+ */
+export class BearerAuthError extends AppError {
+  readonly bearerError: BearerErrorCode | null;
+
+  constructor(
+    code: string,
+    message: string,
+    bearerError: BearerErrorCode | null,
+    details?: unknown
+  ) {
+    super(401, code, message, details);
+    this.name = "BearerAuthError";
+    this.bearerError = bearerError;
+  }
+
+  /** The `WWW-Authenticate` header value for this rejection. */
+  get wwwAuthenticate(): string {
+    if (!this.bearerError) return `Bearer realm="${BEARER_REALM}"`;
+    // quoted-string per RFC 7235: drop the two characters that would end or
+    // escape it, so no message can corrupt the header.
+    const description = this.message.replace(/["\\]/g, "");
+    return `Bearer realm="${BEARER_REALM}", error="${this.bearerError}", error_description="${description}"`;
+  }
+}
+
 /**
  * 403 Forbidden error.
  */

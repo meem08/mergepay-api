@@ -52,6 +52,7 @@ vi.mock("../src/services/stellar", () => ({
   memoText: vi.fn((code: string) => `MP:${code}`),
 }));
 
+import { Keypair } from "@stellar/stellar-sdk";
 import { buildApp } from "../src/app";
 import { signToken } from "../src/plugins/auth";
 import { hashRequest } from "../src/services/idempotency";
@@ -65,9 +66,15 @@ function uniqueViolation() {
   });
 }
 
+// The intent handed to the XDR builder is validated as real ed25519 public
+// keys (#644), so these fixtures use generated keypairs rather than
+// placeholders.
+const PAYER_PUBLIC_KEY = Keypair.random().publicKey();
+const SHARER_PUBLIC_KEY = Keypair.random().publicKey();
+
 const payer = () => ({
   id: "payer_1",
-  stellarPublicKey: "GPAYERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarPublicKey: PAYER_PUBLIC_KEY,
   displayName: "Payer",
   avatarUrl: null,
   createdAt: new Date("2026-01-01T00:00:00.000Z"),
@@ -75,7 +82,7 @@ const payer = () => ({
 
 const sharer = () => ({
   id: "user_1",
-  stellarPublicKey: "GSHAREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  stellarPublicKey: SHARER_PUBLIC_KEY,
   displayName: "Sharer",
   avatarUrl: null,
   createdAt: new Date("2026-01-01T00:00:00.000Z"),

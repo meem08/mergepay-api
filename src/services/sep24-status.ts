@@ -25,6 +25,10 @@
  *
  * Spec: https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0024.md#request-transaction
  */
+import type {
+  Sep24StatusHistoryEntry,
+  Sep24Transaction,
+} from "../types/contract";
 import { safeFailureMessage } from "./job-retry";
 import { isTerminalSep24Status, type Sep24TransactionKind } from "./sep24-types";
 
@@ -72,42 +76,17 @@ export interface Sep24StatusHistoryRow {
 }
 
 /**
- * One transition of Mergepay's own timeline for this transaction. Not a SEP-24
- * field — the spec describes a single `message`, which cannot represent more
- * than the latest status — so it is exposed alongside the spec fields under a
- * name that says so.
- */
-export interface Sep24StatusHistoryEntry {
-  status: string;
-  /** When the session entered `status`, ISO-8601. */
-  at: string;
-  source: string | null;
-  reason: string | null;
-}
-
-/**
  * The SEP-24 transaction object for a session, as returned by
  * `GET /api/sep24/transaction`.
+ *
+ * Defined in `src/types/contract.ts` — the API's frontend-mirrored contract
+ * layer — and aliased here under the name this module has always exported, so
+ * the view type and the documented response shape cannot drift apart.
  */
-export interface Sep24TransactionView {
-  /** The anchor's transaction id when known, else Mergepay's own. */
-  id: string;
-  kind: Sep24TransactionKind;
-  status: string;
-  /**
-   * Mergepay's session id. The spec has no field for it — an anchor is only
-   * ever asked about its own id — but a client that also reads
-   * `/anchors/sessions` needs the two correlated, and `id` can hold either.
-   */
-  session_id: string;
-  more_info_url?: string;
-  started_at: string;
-  updated_at?: string;
-  /** Only once the transaction has reached a terminal status. */
-  completed_at?: string;
-  message?: string;
-  status_history: Sep24StatusHistoryEntry[];
-}
+export type Sep24TransactionView = Sep24Transaction;
+
+/** Re-exported from the contract layer for callers of this module. */
+export type { Sep24StatusHistoryEntry };
 
 function toIso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -165,7 +144,7 @@ export function toSep24TransactionView(
     session.failureReason ?? newest?.reason ?? null
   );
 
-  const view: Sep24TransactionView = {
+  const view: Sep24Transaction = {
     id: session.externalTransactionId ?? session.id,
     kind: toSep24Kind(session.kind),
     status: session.status,

@@ -346,7 +346,10 @@ describe("worker audit writes name their actor (#667/#676)", () => {
     );
 
     return files.map((file) => ({
-      file: path.relative(root, file),
+      // Inventory keys are POSIX-style in the committed table; path.relative
+      // uses the host separator, so normalise it to keep the assertion
+      // meaningful on Windows as well as Linux.
+      file: path.relative(root, file).split(path.sep).join("/"),
       source: readFileSync(file, "utf8"),
     }));
   }

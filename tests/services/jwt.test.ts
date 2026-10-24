@@ -112,7 +112,7 @@ describe("jwt wrapper — verification", () => {
       () => verifyToken(signWith({ expiresIn: -10 })),
       "TOKEN_EXPIRED"
     );
-    expect(err.message).toBe("Token expired");
+    expect(err.message).toBe("Authentication token has expired");
   });
 
   it("rejects a token signed with a different secret", () => {
@@ -125,7 +125,7 @@ describe("jwt wrapper — verification", () => {
   });
 
   it("rejects a malformed token", () => {
-    expectAppError(() => verifyToken("not-a-jwt"), "INVALID_TOKEN");
+    expectAppError(() => verifyToken("not-a-jwt"), "MALFORMED_TOKEN");
   });
 
   it("rejects a payload missing its pk claim", () => {

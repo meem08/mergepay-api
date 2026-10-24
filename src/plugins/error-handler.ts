@@ -1,7 +1,7 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import { ZodError } from "zod";
-import { AppError } from "../lib/errors";
+import { AppError, BearerAuthError } from "../lib/errors";
 import { formatErrorResponse } from "../utils/error-response";
 import { toRequestLimitError } from "../lib/request-limits";
 import { toPrismaError } from "../lib/prisma-error";
@@ -167,6 +167,11 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {  app
     if (err instanceof AppError) {
       if (err instanceof ProviderError && err.retryAfterSeconds !== undefined) {
         reply.header("Retry-After", String(err.retryAfterSeconds));
+      }
+      // RFC 6750 §3: a 401 for a bearer credential names the scheme, and — once
+      // a credential was presented — what was wrong with it.
+      if (err instanceof BearerAuthError) {
+        reply.header("WWW-Authenticate", err.wwwAuthenticate);
       }
       return reply.code(err.status).send(
         formatErrorResponse(err.code, err.message, requestId, err.details)

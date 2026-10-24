@@ -158,6 +158,75 @@ export interface AnchorSession {
   createdAt: string;
 }
 
+/** Which side of the anchor flow a SEP-24 transaction represents. */
+export type Sep24TransactionKind = "deposit" | "withdrawal";
+
+/**
+ * One transition in Mergepay's own SEP-24 timeline.
+ *
+ * Not a SEP-24 spec field: the spec carries a single `message`, which cannot
+ * represent more than the latest status. Exposed alongside the spec fields
+ * under a name that makes the addition explicit.
+ */
+export interface Sep24StatusHistoryEntry {
+  status: string;
+  /** When the session entered `status`, ISO-8601. */
+  at: string;
+  source: string | null;
+  reason: string | null;
+}
+
+/**
+ * The SEP-24 `GET /transaction` object as served by Mergepay.
+ *
+ * Sourced from the frontend contract definitions in
+ * `mergepay-web/src/lib/types.ts`. Field names follow the SEP-24 spec (snake
+ * case) because this object is consumed by SEP-24-aware wallets; `session_id`
+ * and `status_history` are Mergepay's additions and are named so they cannot be
+ * mistaken for spec fields.
+ */
+export interface Sep24Transaction {
+  /** The anchor's transaction id when known, else Mergepay's own. */
+  id: string;
+  kind: Sep24TransactionKind;
+  status: string;
+  /** Mergepay's session id, correlating this view with `/anchors/sessions`. */
+  session_id: string;
+  more_info_url?: string;
+  started_at: string;
+  updated_at?: string;
+  /** Only once the transaction has reached a terminal status. */
+  completed_at?: string;
+  message?: string;
+  status_history: Sep24StatusHistoryEntry[];
+}
+
+/** SEP-24 transaction list envelope (`GET /sep24/transactions`). */
+export interface Sep24TransactionListResponse {
+  transactions: Sep24Transaction[];
+  meta: PaginationMeta;
+}
+
+/** The SEP-10 challenge returned when a SEP-24 interactive flow starts. */
+export interface Sep24Challenge {
+  transaction: string;
+  networkPassphrase: string;
+}
+
+/** Response of `POST /anchors/deposit|withdraw` and `/sep24/deposit|withdraw`. */
+export interface Sep24InitiateResponse {
+  session: AnchorSession;
+  challenge: Sep24Challenge;
+}
+
+/** Response of `POST /anchors/sessions/:id/complete`. */
+export interface Sep24CompleteResponse {
+  type: "interactive";
+  url: string;
+  id: string;
+  session: AnchorSession;
+}
+
 export interface AuditLogEntry {
   id: string;
   createdAt: string;

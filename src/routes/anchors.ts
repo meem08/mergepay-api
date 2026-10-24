@@ -1,5 +1,4 @@
 import { FastifyInstance, FastifyRequest } from "fastify";
-import { z } from "zod";
 import { timingSafeEqual } from "node:crypto";
 import { prisma } from "../db";
 import { config } from "../config";
@@ -26,8 +25,11 @@ import { serializeAnchorSession } from "../serializers";
 import { getStatusHistory } from "../services/status-history";
 import { validateAsset } from "../services/assets";
 import {
+  sep24CompleteRequestSchema,
   sep24DepositRequestSchema,
   sep24InitQuerySchema,
+  sep24SessionParamsSchema,
+  sep24SessionQuerySchema,
   sep24WithdrawRequestSchema,
 } from "../validations/sep24";
 import { sep24CallbackSchema } from "../schemas/sep24";
@@ -218,9 +220,13 @@ export default async function anchorRoutes(app: FastifyInstance) {
         tags: ["SEP-24"],
         summary: "Complete SEP-24 interactive session",
         description:
-          "Exchanges signed SEP-10 challenge for an anchor JWT and returns the SEP-24 interactive URL.",
+          "Validates the session path, query, and signed SEP-10 challenge XDR with Zod, exchanges it for an anchor JWT, and returns the SEP-24 interactive URL.",
         params: openApiIdParams(),
-        body: openApiBody(z.object({ signedXdr: z.string().min(1) }).strict()),
+        querystring: openApiBody(sep24SessionQuerySchema, { enforce: false }),
+        // Documented from the same Zod schema the handler parses with, with the
+        // rules stripped so the handler's parse is the only validator and a
+        // rejection keeps the documented VALIDATION_ERROR envelope.
+        body: openApiBody(sep24CompleteRequestSchema, { enforce: false }),
         response: {
           200: {
             type: "object",
@@ -238,8 +244,11 @@ export default async function anchorRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
-      const body = z.object({ signedXdr: z.string().min(1) }).strict().parse(req.body);
+      // Query, path, then body: all Zod-owned, and all parsed before the
+      // session is read or the anchor is contacted.
+      sep24SessionQuerySchema.parse(req.query ?? {});
+      const { id } = sep24SessionParamsSchema.parse(req.params);
+      const body = sep24CompleteRequestSchema.parse(req.body);
 
       const session = await prisma.anchorSession.findUnique({
         where: { id },
@@ -336,14 +345,19 @@ export default async function anchorRoutes(app: FastifyInstance) {
       schema: {
         tags: ["SEP-24"],
         summary: "Get anchor session status",
-        description: "Returns details and status for a specific SEP-24 anchor session.",
+        description:
+          "Validates the session path and query with Zod, then returns details and status for a specific SEP-24 anchor session.",
         params: openApiIdParams(),
+        querystring: openApiBody(sep24SessionQuerySchema, { enforce: false }),
         response: openApiEnvelope("session"),
       },
     },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+      // Unknown query parameters are rejected rather than ignored, matching
+      // every other SEP-24 status read in this API.
+      sep24SessionQuerySchema.parse(req.query ?? {});
+      const { id } = sep24SessionParamsSchema.parse(req.params);
 
       const session = await prisma.anchorSession.findUnique({
         where: { id },
