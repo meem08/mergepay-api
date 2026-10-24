@@ -204,4 +204,24 @@ The following environment variables can be used to configure integration tests:
 - If friendbot funding fails, the tests include retry logic with backoff.
 - Ensure the backend server is fully started before running integration tests.
 
+### CI Prisma Checks
+
+CI validates the Prisma schema and migration state on every PR:
+
+- **`build-test` job** — runs `npm run prisma:validate` after `prisma:generate`. A schema syntax error or invalid relation fails the job before the TypeScript build or test suite runs.
+- **`integration` job** — runs `npm run prisma:validate` before the integration suite for consistency.
+- **`migration` job** — runs the full migration pipeline:
+  1. `npm run prisma:validate` — schema must be syntactically valid
+  2. `npx prisma migrate deploy` — the entire committed migration history must deploy cleanly to a fresh Postgres database
+  3. `npm run prisma:status` — migration status must be consistent
+  4. `npm run prisma:check-drift` — the deployed database state must equal `prisma/schema.prisma` (exit code 0); any diff means migrations drifted from the schema and must be reconciled before merge
+
+Locally, run the same checks before pushing:
+
+```bash
+npm run prisma:validate      # schema syntax
+npm run prisma:status        # migration status (needs DATABASE_URL)
+npm run prisma:check-drift   # schema vs. deployed database (needs DATABASE_URL)
+```
+
 ### Final Stage

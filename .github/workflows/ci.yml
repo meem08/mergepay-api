@@ -9,6 +9,8 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/mergepay_test"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,6 +19,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run prisma:generate
+      # Fail fast on an invalid Prisma schema before building or testing
+      - name: Validate Prisma schema
+        run: npm run prisma:validate
       - run: npm run build
       - run: npm test
 
@@ -53,6 +58,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mergepay_test
       DATABASE_URL_TEST: postgresql://postgres:postgres@localhost:5432/mergepay_test
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/mergepay_test"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -61,6 +67,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run prisma:generate
+      # Fail fast on an invalid Prisma schema before running integration tests
+      - name: Validate Prisma schema
+        run: npm run prisma:validate
       - run: npm run test:integration
 
   # Issue #671 — the migration history must be *deployable* and must *converge*
